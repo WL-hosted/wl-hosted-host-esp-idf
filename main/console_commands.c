@@ -16,6 +16,14 @@ typedef struct command_wait {
     wlh_host_result_t result;
     uint16_t domain;
     int16_t status;
+    /* Typed responses are copied here by their completion so the printing
+       happens on the console task rather than the Core task. */
+    bool has_io_state;
+    wlh_host_io_state_t io_state;
+    bool has_adc_sample;
+    wlh_host_adc_sample_t adc_sample;
+    bool has_kv_value;
+    char kv_value[WLH_HOST_MAX_KV_VALUE_SIZE + 1u];
 } command_wait_t;
 
 static const char *TAG = "wlh-console";
@@ -31,6 +39,47 @@ static void command_completion(void *context, wlh_host_result_t result,
     wait->result = result;
     wait->domain = domain;
     wait->status = status;
+    xSemaphoreGive(wait->done);
+}
+
+static void io_read_completion(void *context, wlh_host_result_t result,
+                               uint16_t domain, int16_t status,
+                               const wlh_host_io_state_t *state) {
+    command_wait_t *wait = context;
+    wait->result = result;
+    wait->domain = domain;
+    wait->status = status;
+    wait->has_io_state = state != NULL;
+    if (state != NULL) wait->io_state = *state;
+    xSemaphoreGive(wait->done);
+}
+
+static void adc_read_completion(void *context, wlh_host_result_t result,
+                                uint16_t domain, int16_t status,
+                                const wlh_host_adc_sample_t *sample) {
+    command_wait_t *wait = context;
+    wait->result = result;
+    wait->domain = domain;
+    wait->status = status;
+    wait->has_adc_sample = sample != NULL;
+    if (sample != NULL) wait->adc_sample = *sample;
+    xSemaphoreGive(wait->done);
+}
+
+static void kv_read_completion(void *context, wlh_host_result_t result,
+                               uint16_t domain, int16_t status,
+                               const char *value, size_t value_size) {
+    command_wait_t *wait = context;
+    wait->result = result;
+    wait->domain = domain;
+    wait->status = status;
+    wait->has_kv_value = value != NULL;
+    if (value != NULL && value_size < sizeof(wait->kv_value)) {
+        memcpy(wait->kv_value, value, value_size);
+        wait->kv_value[value_size] = '\0';
+    } else {
+        wait->has_kv_value = false;
+    }
     xSemaphoreGive(wait->done);
 }
 
@@ -233,6 +282,226 @@ static int ping_command(int argc, char **argv) {
     return 0;
 }
 
+static const char *io_mode_name(wlh_host_io_mode_t mode) {
+    switch (mode) {
+    case WLH_HOST_IO_MODE_INPUT:
+        return "in";
+    case WLH_HOST_IO_MODE_OUTPUT:
+        return "out";
+    default:
+        return "od";
+    }
+}
+
+static const char *io_pull_name(wlh_host_io_pull_t pull) {
+    switch (pull) {
+    case WLH_HOST_IO_PULL_UP:
+        return "up";
+    case WLH_HOST_IO_PULL_DOWN:
+        return "down";
+    default:
+        return "none";
+    }
+}
+
+/* Returns false on an unparseable pin so the command can report usage. */
+static bool parse_pin(const char *text, uint32_t *pin_id) {
+    char *end = NULL;
+    unsigned long value = strtoul(text, &end, 10);
+    if (end == text || *end != '\0' || value > 0xffffffffUL) return false;
+    *pin_id = (uint32_t)value;
+    return true;
+}
+
+static int io_config_command(int argc, char **argv) {
+    command_wait_t wait;
+    wlh_host_io_config_t config = {0};
+    wlh_host_result_t submitted;
+    int result;
+    if (argc < 3 || argc > 5) {
+        printf("usage: io_config <pin> <in|out|od> [none|up|down] [0|1]\n");
+        return 1;
+    }
+    if (!parse_pin(argv[1], &config.pin_id)) {
+        printf("invalid pin: %s\n", argv[1]);
+        return 1;
+    }
+    if (strcmp(argv[2], "in") == 0)
+        config.mode = WLH_HOST_IO_MODE_INPUT;
+    else if (strcmp(argv[2], "out") == 0)
+        config.mode = WLH_HOST_IO_MODE_OUTPUT;
+    else if (strcmp(argv[2], "od") == 0)
+        config.mode = WLH_HOST_IO_MODE_OPEN_DRAIN;
+    else {
+        printf("invalid mode: %s (expected in, out or od)\n", argv[2]);
+        return 1;
+    }
+    config.pull = WLH_HOST_IO_PULL_NONE;
+    if (argc >= 4) {
+        if (strcmp(argv[3], "none") == 0)
+            config.pull = WLH_HOST_IO_PULL_NONE;
+        else if (strcmp(argv[3], "up") == 0)
+            config.pull = WLH_HOST_IO_PULL_UP;
+        else if (strcmp(argv[3], "down") == 0)
+            config.pull = WLH_HOST_IO_PULL_DOWN;
+        else {
+            printf("invalid pull: %s (expected none, up or down)\n", argv[3]);
+            return 1;
+        }
+    }
+    if (argc == 5) config.initial_level = strcmp(argv[4], "0") != 0;
+
+    wait = new_wait();
+    if (wait.done == NULL) return 1;
+    xSemaphoreTake(console_app->command_lock, portMAX_DELAY);
+    submitted = wlh_host_io_configure(&console_app->host, &config,
+                                      command_completion, &wait);
+    result = wait_for_command(&wait, submitted);
+    xSemaphoreGive(console_app->command_lock);
+    delete_wait(&wait);
+    return result;
+}
+
+static int io_read_command(int argc, char **argv) {
+    command_wait_t wait;
+    uint32_t pin_id;
+    wlh_host_result_t submitted;
+    int result;
+    if (argc != 2) {
+        printf("usage: io_read <pin>\n");
+        return 1;
+    }
+    if (!parse_pin(argv[1], &pin_id)) {
+        printf("invalid pin: %s\n", argv[1]);
+        return 1;
+    }
+    wait = new_wait();
+    if (wait.done == NULL) return 1;
+    xSemaphoreTake(console_app->command_lock, portMAX_DELAY);
+    submitted =
+        wlh_host_io_read(&console_app->host, pin_id, io_read_completion, &wait);
+    result = wait_for_command(&wait, submitted);
+    if (result == 0 && wait.has_io_state)
+        printf("pin=%lu level=%u mode=%s pull=%s\n",
+               (unsigned long)wait.io_state.pin_id,
+               wait.io_state.level ? 1u : 0u, io_mode_name(wait.io_state.mode),
+               io_pull_name(wait.io_state.pull));
+    xSemaphoreGive(console_app->command_lock);
+    delete_wait(&wait);
+    return result;
+}
+
+static int io_write_command(int argc, char **argv) {
+    command_wait_t wait;
+    uint32_t pin_id;
+    wlh_host_result_t submitted;
+    int result;
+    if (argc != 3) {
+        printf("usage: io_write <pin> <0|1>\n");
+        return 1;
+    }
+    if (!parse_pin(argv[1], &pin_id)) {
+        printf("invalid pin: %s\n", argv[1]);
+        return 1;
+    }
+    wait = new_wait();
+    if (wait.done == NULL) return 1;
+    xSemaphoreTake(console_app->command_lock, portMAX_DELAY);
+    submitted =
+        wlh_host_io_write(&console_app->host, pin_id, strcmp(argv[2], "0") != 0,
+                          command_completion, &wait);
+    result = wait_for_command(&wait, submitted);
+    xSemaphoreGive(console_app->command_lock);
+    delete_wait(&wait);
+    return result;
+}
+
+static int adc_read_command(int argc, char **argv) {
+    command_wait_t wait;
+    uint32_t pin_id;
+    wlh_host_result_t submitted;
+    int result;
+    if (argc != 2) {
+        printf("usage: adc_read <pin>\n");
+        return 1;
+    }
+    if (!parse_pin(argv[1], &pin_id)) {
+        printf("invalid pin: %s\n", argv[1]);
+        return 1;
+    }
+    wait = new_wait();
+    if (wait.done == NULL) return 1;
+    xSemaphoreTake(console_app->command_lock, portMAX_DELAY);
+    submitted = wlh_host_adc_read(&console_app->host, pin_id,
+                                  adc_read_completion, &wait);
+    result = wait_for_command(&wait, submitted);
+    if (result == 0 && wait.has_adc_sample)
+        printf("pin=%lu mv=%lu\n", (unsigned long)wait.adc_sample.pin_id,
+               (unsigned long)wait.adc_sample.millivolts);
+    xSemaphoreGive(console_app->command_lock);
+    delete_wait(&wait);
+    return result;
+}
+
+static int kv_read_command(int argc, char **argv) {
+    command_wait_t wait;
+    wlh_host_result_t submitted;
+    int result;
+    if (argc != 2) {
+        printf("usage: kv_read <key>\n");
+        return 1;
+    }
+    wait = new_wait();
+    if (wait.done == NULL) return 1;
+    xSemaphoreTake(console_app->command_lock, portMAX_DELAY);
+    submitted = wlh_host_kv_read(&console_app->host, argv[1],
+                                 kv_read_completion, &wait);
+    result = wait_for_command(&wait, submitted);
+    if (result == 0 && wait.has_kv_value)
+        printf("value=\"%s\"\n", wait.kv_value);
+    xSemaphoreGive(console_app->command_lock);
+    delete_wait(&wait);
+    return result;
+}
+
+static int kv_write_command(int argc, char **argv) {
+    command_wait_t wait;
+    wlh_host_result_t submitted;
+    int result;
+    if (argc != 3) {
+        printf("usage: kv_write <key> <value>\n");
+        return 1;
+    }
+    wait = new_wait();
+    if (wait.done == NULL) return 1;
+    xSemaphoreTake(console_app->command_lock, portMAX_DELAY);
+    submitted = wlh_host_kv_write(&console_app->host, argv[1], argv[2],
+                                  command_completion, &wait);
+    result = wait_for_command(&wait, submitted);
+    xSemaphoreGive(console_app->command_lock);
+    delete_wait(&wait);
+    return result;
+}
+
+static int kv_erase_command(int argc, char **argv) {
+    command_wait_t wait;
+    wlh_host_result_t submitted;
+    int result;
+    if (argc != 2) {
+        printf("usage: kv_erase <key>\n");
+        return 1;
+    }
+    wait = new_wait();
+    if (wait.done == NULL) return 1;
+    xSemaphoreTake(console_app->command_lock, portMAX_DELAY);
+    submitted = wlh_host_kv_erase(&console_app->host, argv[1],
+                                  command_completion, &wait);
+    result = wait_for_command(&wait, submitted);
+    xSemaphoreGive(console_app->command_lock);
+    delete_wait(&wait);
+    return result;
+}
+
 static void register_command(const char *name, const char *help,
                              esp_console_cmd_func_t function) {
     const esp_console_cmd_t command = {
@@ -260,6 +529,15 @@ void wlh_console_start(wlh_app_t *app) {
     register_command("ap_stop", "stop SoftAP", ap_stop_command);
     register_command("ping", "ping [hostname], default baidu.com",
                      ping_command);
+    register_command("io_config",
+                     "io_config <pin> <in|out|od> [none|up|down] [0|1]",
+                     io_config_command);
+    register_command("io_read", "io_read <pin>", io_read_command);
+    register_command("io_write", "io_write <pin> <0|1>", io_write_command);
+    register_command("adc_read", "adc_read <pin>", adc_read_command);
+    register_command("kv_read", "kv_read <key>", kv_read_command);
+    register_command("kv_write", "kv_write <key> <value>", kv_write_command);
+    register_command("kv_erase", "kv_erase <key>", kv_erase_command);
 #if defined(CONFIG_ESP_CONSOLE_UART_DEFAULT) ||                                \
     defined(CONFIG_ESP_CONSOLE_UART_CUSTOM)
     esp_console_dev_uart_config_t uart_config =

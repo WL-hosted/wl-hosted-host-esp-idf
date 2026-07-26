@@ -51,7 +51,19 @@ sta_disconnect
 ap_start <ssid> [password] [channel]
 ap_stop
 ping [hostname]
+io_config <pin> <in|out|od> [none|up|down] [0|1]
+io_read <pin>
+io_write <pin> <0|1>
+adc_read <pin>
+kv_read <key>
+kv_write <key> <value>
+kv_erase <key>
 ```
+
+The `io_*` and `adc_read` pin numbers are logical profile pins, not GPIO
+numbers; the coprocessor README lists the mapping for each target. `io_write`
+requires the pin to have been configured as `out` or `od` first, and `kv_write`
+persists the value on the coprocessor across resets.
 
 `ping` defaults to `baidu.com` and sends four ICMP echo requests. Station mode
 uses an lwIP DHCP client. SoftAP creates a separate Ethernet netif at
