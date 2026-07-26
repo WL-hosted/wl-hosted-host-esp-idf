@@ -27,12 +27,21 @@ static esp_netif_t *sta_netif;
 static esp_netif_t *ap_netif;
 static netif_driver_t sta_driver;
 static netif_driver_t ap_driver;
+/* Temporary datapath diagnostics: count frames per leg to locate drops. */
+static uint32_t sta_tx_frames;
+static uint32_t sta_tx_errors;
+static uint32_t sta_rx_frames;
+static uint32_t ap_rx_frames;
 
 static esp_err_t transmit(void *handle, void *buffer, size_t size) {
     netif_driver_t *driver = handle;
     wlh_host_result_t result =
         driver->ap ? wlh_host_ethernet_ap_send(driver->host, buffer, size)
                    : wlh_host_ethernet_sta_send(driver->host, buffer, size);
+    if (!driver->ap) {
+        ++sta_tx_frames;
+        if (result != WLH_HOST_OK) ++sta_tx_errors;
+    }
     return result == WLH_HOST_OK ? ESP_OK : ESP_FAIL;
 }
 
@@ -117,6 +126,10 @@ void wlh_network_input(bool ap, const uint8_t *frame, size_t size) {
     void *copy;
     esp_netif_t *netif = ap ? ap_netif : sta_netif;
     if (frame == NULL || size < 14u || size > 1518u) return;
+    if (ap)
+        ++ap_rx_frames;
+    else
+        ++sta_rx_frames;
     copy = malloc(size);
     if (copy == NULL) return;
     memcpy(copy, frame, size);
@@ -137,12 +150,15 @@ static void print_netif(const char *name, esp_netif_t *netif) {
 void wlh_network_print_status(void) {
     print_netif("sta", sta_netif);
     print_netif("ap ", ap_netif);
+    printf("datapath: sta_tx=%lu sta_tx_err=%lu sta_rx=%lu ap_rx=%lu\n",
+           (unsigned long)sta_tx_frames, (unsigned long)sta_tx_errors,
+           (unsigned long)sta_rx_frames, (unsigned long)ap_rx_frames);
 }
 
 static void ping_success(esp_ping_handle_t handle, void *context) {
     uint32_t sequence;
     uint32_t time_ms;
-    uint32_t ttl;
+    uint8_t ttl;
     ip_addr_t address;
     esp_ping_get_profile(handle, ESP_PING_PROF_SEQNO, &sequence,
                          sizeof(sequence));
@@ -194,9 +210,9 @@ esp_err_t wlh_network_ping(const char *hostname, uint32_t count) {
     if (getaddrinfo(hostname, NULL, &hints, &address_info) != 0 ||
         address_info == NULL)
         return ESP_ERR_NOT_FOUND;
-    inet_addr_to_ip4addr(
-        ip_2_ip4(&config.target_addr),
-        &((struct sockaddr_in *)address_info->ai_addr)->sin_addr);
+    ip_addr_set_ip4_u32(
+        &config.target_addr,
+        ((struct sockaddr_in *)address_info->ai_addr)->sin_addr.s_addr);
     freeaddrinfo(address_info);
     config.count = count;
     config.timeout_ms = 1000u;

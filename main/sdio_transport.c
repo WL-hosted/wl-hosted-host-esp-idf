@@ -51,7 +51,7 @@
 #define WLH_SDIO_FBR_FUNCTION1 0x100u
 
 #define WLH_SDIO_TX_QUEUE_DEPTH 16u
-#define WLH_SDIO_INIT_RETRIES 30u
+#define WLH_SDIO_INIT_RETRIES 3u
 
 typedef struct tx_job {
     uint8_t *frame;
@@ -141,8 +141,8 @@ static esp_err_t enable_function(void) {
 static void c6_enable_pulse(void) {
     gpio_config_t config = {
         .pin_bit_mask = 1ULL << WLH_C6_ENABLE_GPIO,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .mode = GPIO_MODE_OUTPUT_OD,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
@@ -150,7 +150,10 @@ static void c6_enable_pulse(void) {
     gpio_set_level(WLH_C6_ENABLE_GPIO, 0);
     vTaskDelay(pdMS_TO_TICKS(100u));
     gpio_set_level(WLH_C6_ENABLE_GPIO, 1);
-    vTaskDelay(pdMS_TO_TICKS(500u));
+    /* Wait for the C6 to boot and start its SDIO slave (~600 ms worst case)
+       so the first sdmmc_card_init attempt succeeds; retries are only a
+       fallback for genuine line trouble. */
+    vTaskDelay(pdMS_TO_TICKS(1500u));
 }
 
 static esp_err_t hardware_start(void) {
@@ -193,18 +196,22 @@ static esp_err_t hardware_start(void) {
     transport.tx_buffer_count = 0u;
     {
         const uint32_t interrupt_enable = WLH_SDIO_NEW_PACKET_BIT;
-        const uint8_t reset_interrupt = 1u;
         result = write_register(WLH_SDIO_REG_HOST_INT_ENABLE, &interrupt_enable,
                                 sizeof(interrupt_enable));
-        if (result == ESP_OK)
-            result = write_register(WLH_SDIO_REG_HOST_TO_SLAVE,
-                                    &reset_interrupt, sizeof(reset_interrupt));
     }
+    /* Do not write a soft link reset (WLH_SDIO_REG_HOST_TO_SLAVE) here:
+       hardware_start always cold-boots the C6 via the EN pulse, so the slave
+       already starts with a fresh link core in WAITING_FOR_HELLO. The slave
+       handles a soft reset asynchronously (SDIO stop/reset/start, then a core
+       restart ~150 ms later); triggering it after card init races with Hello
+       negotiation and tears down the freshly negotiated session, leaving the
+       host stuck in READY until heartbeat timeout — an endless recover loop. */
     if (result != ESP_OK) goto fail_slot;
     transport.hardware_initialized = true;
-    ESP_LOGI(TAG, "SDIO ready: 40 MHz 4-bit CLK=%d CMD=%d D0..D3=%d,%d,%d,%d",
-             WLH_SDIO_CLK_GPIO, WLH_SDIO_CMD_GPIO, WLH_SDIO_D0_GPIO,
-             WLH_SDIO_D1_GPIO, WLH_SDIO_D2_GPIO, WLH_SDIO_D3_GPIO);
+    ESP_LOGI(TAG, "SDIO ready: %u kHz 4-bit CLK=%d CMD=%d D0..D3=%d,%d,%d,%d",
+             (unsigned)transport.sdmmc.max_freq_khz, WLH_SDIO_CLK_GPIO,
+             WLH_SDIO_CMD_GPIO, WLH_SDIO_D0_GPIO, WLH_SDIO_D1_GPIO,
+             WLH_SDIO_D2_GPIO, WLH_SDIO_D3_GPIO);
     return ESP_OK;
 
 fail_slot:
@@ -244,6 +251,47 @@ static esp_err_t wait_for_tx_buffer(void) {
     return ESP_ERR_TIMEOUT;
 }
 
+static esp_err_t read_data(uint32_t address, uint8_t *data, size_t size) {
+    size_t remaining = size;
+    uint8_t *position = data;
+
+    while (remaining >= WLH_SDIO_BLOCK_SIZE) {
+        size_t block_size =
+            (remaining / WLH_SDIO_BLOCK_SIZE) * WLH_SDIO_BLOCK_SIZE;
+        esp_err_t result = sdmmc_io_read_blocks(
+            &transport.card, WLH_SDIO_FUNCTION, address, position, block_size);
+        if (result != ESP_OK) return result;
+        remaining -= block_size;
+        position += block_size;
+        address += block_size;
+    }
+    if (remaining > 0u)
+        return sdmmc_io_read_bytes(&transport.card, WLH_SDIO_FUNCTION, address,
+                                   position, remaining);
+    return ESP_OK;
+}
+
+static esp_err_t write_data(uint32_t address, const uint8_t *data,
+                            size_t size) {
+    size_t remaining = size;
+    const uint8_t *position = data;
+
+    while (remaining >= WLH_SDIO_BLOCK_SIZE) {
+        size_t block_size =
+            (remaining / WLH_SDIO_BLOCK_SIZE) * WLH_SDIO_BLOCK_SIZE;
+        esp_err_t result = sdmmc_io_write_blocks(
+            &transport.card, WLH_SDIO_FUNCTION, address, position, block_size);
+        if (result != ESP_OK) return result;
+        remaining -= block_size;
+        position += block_size;
+        address += block_size;
+    }
+    if (remaining > 0u)
+        return sdmmc_io_write_bytes(&transport.card, WLH_SDIO_FUNCTION, address,
+                                    position, remaining);
+    return ESP_OK;
+}
+
 static esp_err_t write_frame(const uint8_t *frame, size_t size) {
     uint32_t transfer_size = round_up_4(size);
     uint8_t *dma_frame =
@@ -254,9 +302,8 @@ static esp_err_t write_frame(const uint8_t *frame, size_t size) {
     xSemaphoreTake(transport.bus_lock, portMAX_DELAY);
     result = wait_for_tx_buffer();
     if (result == ESP_OK) {
-        result = sdmmc_io_write_bytes(&transport.card, WLH_SDIO_FUNCTION,
-                                      WLH_SDIO_END_ADDRESS - size, dma_frame,
-                                      transfer_size);
+        result =
+            write_data(WLH_SDIO_END_ADDRESS - size, dma_frame, transfer_size);
     }
     xSemaphoreGive(transport.bus_lock);
     heap_caps_free(dma_frame);
@@ -296,21 +343,32 @@ static esp_err_t read_pending_frame(uint8_t *frame, size_t *frame_size) {
         return ESP_ERR_NOT_FOUND;
     result = read_register(WLH_SDIO_REG_PACKET_LEN, &packet_length,
                            sizeof(packet_length));
+    /* Clear the interrupt on every path: a failed or garbage transaction
+       must never leave the bit asserted and wedge the RX task. */
+    esp_err_t clear_result = write_register(
+        WLH_SDIO_REG_INT_CLEAR, &interrupt_status, sizeof(interrupt_status));
     if (result != ESP_OK) return result;
+    if (clear_result != ESP_OK) return clear_result;
     packet_length &= WLH_SDIO_LENGTH_MASK;
     size = (packet_length + WLH_SDIO_LENGTH_MODULUS - transport.rx_byte_count) %
            WLH_SDIO_LENGTH_MODULUS;
-    if (size < WLH_FRAME_HEADER_SIZE || size > WLH_SDIO_MAX_FRAME_SIZE)
+    if (packet_length == WLH_SDIO_LENGTH_MASK || size < WLH_FRAME_HEADER_SIZE ||
+        size > WLH_SDIO_MAX_FRAME_SIZE) {
+        /* Floating bus or lost framing (e.g. slave mid-reset): drop this
+           transaction and resynchronize to the slave's counter. */
+        transport.rx_byte_count = packet_length;
         return ESP_ERR_INVALID_SIZE;
+    }
     transfer_size = round_up_4(size);
-    result =
-        sdmmc_io_read_bytes(&transport.card, WLH_SDIO_FUNCTION,
-                            WLH_SDIO_END_ADDRESS - size, frame, transfer_size);
-    if (result != ESP_OK) return result;
+    result = read_data(WLH_SDIO_END_ADDRESS - size, frame, transfer_size);
+    if (result != ESP_OK) {
+        /* The frame is lost; resynchronize so the next interrupt starts
+           from a clean byte-count baseline. */
+        transport.rx_byte_count = packet_length;
+        return result;
+    }
     transport.rx_byte_count = packet_length;
     *frame_size = size;
-    (void)write_register(WLH_SDIO_REG_INT_CLEAR, &interrupt_status,
-                         sizeof(interrupt_status));
     return ESP_OK;
 }
 
@@ -333,18 +391,43 @@ static void rx_task_main(void *argument) {
                      esp_err_to_name(result));
             continue;
         }
-        xSemaphoreTake(transport.bus_lock, portMAX_DELAY);
-        result = read_pending_frame(frame, &size);
-        xSemaphoreGive(transport.bus_lock);
-        if (result == ESP_ERR_NOT_FOUND) continue;
-        if (result != ESP_OK ||
-            wlh_frame_validate(frame, size, WLH_SDIO_MAX_FRAME_SIZE) !=
+        for (;;) {
+            /* Drain every queued frame; the slave may have posted more
+               than one transaction per interrupt. Hold the SDIO bus only
+               for one CMD53 transaction so the TX task can return credits
+               between received Ethernet frames. */
+            xSemaphoreTake(transport.bus_lock, portMAX_DELAY);
+            result = read_pending_frame(frame, &size);
+            xSemaphoreGive(transport.bus_lock);
+            if (result == ESP_ERR_NOT_FOUND) break;
+            if (result == ESP_ERR_INVALID_SIZE) {
+                ESP_LOGW(TAG, "dropping invalid SDIO RX transaction");
+                continue;
+            }
+            if (result != ESP_OK) {
+                ESP_LOGW(TAG, "SDIO RX read failed: %s",
+                         esp_err_to_name(result));
+                break;
+            }
+            if (wlh_frame_validate(frame, size, WLH_SDIO_MAX_FRAME_SIZE) !=
                 WLH_WIRE_OK) {
-            ESP_LOGW(TAG, "dropping invalid SDIO RX transaction");
-            continue;
+                ESP_LOGW(TAG, "dropping invalid SDIO RX transaction");
+                continue;
+            }
+            {
+                wlh_host_result_t host_result;
+                do {
+                    host_result =
+                        wlh_host_on_frame(transport.host, frame, size);
+                    if (host_result == WLH_HOST_PENDING_FULL)
+                        vTaskDelay(pdMS_TO_TICKS(1u));
+                } while (host_result == WLH_HOST_PENDING_FULL &&
+                         atomic_load(&transport.running));
+                if (host_result != WLH_HOST_OK)
+                    ESP_LOGW(TAG, "Host Core rejected SDIO frame: %d",
+                             (int)host_result);
+            }
         }
-        if (wlh_host_on_frame(transport.host, frame, size) != WLH_HOST_OK)
-            ESP_LOGW(TAG, "Host Core rejected SDIO frame");
     }
 }
 
@@ -415,9 +498,12 @@ int wlh_sdio_transport_init(wlh_host_t *host) {
         return -1;
     if (xTaskCreate(lifecycle_task_main, "wlh-sdio-life", 6144u, NULL, 7,
                     NULL) != pdPASS ||
-        xTaskCreate(tx_task_main, "wlh-sdio-tx", 4096u, NULL, 6, NULL) !=
+        /* TX must preempt RX after Host Core queues a CreditUpdate. Otherwise
+           a continuous RX burst can fill the bounded TX queue and permanently
+           lose credits until the coprocessor reaches CONGESTED. */
+        xTaskCreate(tx_task_main, "wlh-sdio-tx", 4096u, NULL, 9, NULL) !=
             pdPASS ||
-        xTaskCreate(rx_task_main, "wlh-sdio-rx", 4096u, NULL, 7, NULL) !=
+        xTaskCreate(rx_task_main, "wlh-sdio-rx", 4096u, NULL, 6, NULL) !=
             pdPASS)
         return -1;
     return 0;

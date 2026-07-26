@@ -51,6 +51,20 @@ static int wait_for_command(command_wait_t *wait, wlh_host_result_t submitted) {
     return result;
 }
 
+static int wait_for_operation(command_wait_t *wait, wlh_host_result_t submitted,
+                              uint32_t timeout_ms) {
+    int result = wait_for_command(wait, submitted);
+    if (result == 0) {
+        if (xSemaphoreTake(console_app->operation_done,
+                           pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+            printf("operation did not complete in time\n");
+            result = 1;
+        }
+    }
+    console_app->pending_operation = WLH_APP_OP_NONE;
+    return result;
+}
+
 static command_wait_t new_wait(void) {
     command_wait_t wait = {0};
     wait.done = xSemaphoreCreateBinary();
@@ -93,9 +107,16 @@ static int scan_command(int argc, char **argv) {
     (void)argv;
     if (wait.done == NULL) return 1;
     xSemaphoreTake(console_app->command_lock, portMAX_DELAY);
+    /* Drop any stale completion from a previous scan. */
+    (void)xSemaphoreTake(console_app->scan_done, 0);
     submitted = wlh_host_wifi_scan(&console_app->host, &params,
                                    command_completion, &wait);
     result = wait_for_command(&wait, submitted);
+    if (result == 0 && xSemaphoreTake(console_app->scan_done,
+                                      pdMS_TO_TICKS(30000u)) != pdTRUE) {
+        printf("scan did not complete in time\n");
+        result = 1;
+    }
     xSemaphoreGive(console_app->command_lock);
     delete_wait(&wait);
     return result;
@@ -123,9 +144,11 @@ static int sta_connect_command(int argc, char **argv) {
     }
     params.timeout_ms = 15000u;
     xSemaphoreTake(console_app->command_lock, portMAX_DELAY);
+    (void)xSemaphoreTake(console_app->operation_done, 0);
+    console_app->pending_operation = WLH_APP_OP_CONNECT;
     submitted = wlh_host_wifi_connect(&console_app->host, &params,
                                       command_completion, &wait);
-    result = wait_for_command(&wait, submitted);
+    result = wait_for_operation(&wait, submitted, 20000u);
     xSemaphoreGive(console_app->command_lock);
     delete_wait(&wait);
     return result;
@@ -139,9 +162,11 @@ static int sta_disconnect_command(int argc, char **argv) {
     (void)argv;
     if (wait.done == NULL) return 1;
     xSemaphoreTake(console_app->command_lock, portMAX_DELAY);
+    (void)xSemaphoreTake(console_app->operation_done, 0);
+    console_app->pending_operation = WLH_APP_OP_DISCONNECT;
     submitted =
         wlh_host_wifi_disconnect(&console_app->host, command_completion, &wait);
-    result = wait_for_command(&wait, submitted);
+    result = wait_for_operation(&wait, submitted, 10000u);
     xSemaphoreGive(console_app->command_lock);
     delete_wait(&wait);
     return result;
@@ -170,9 +195,11 @@ static int ap_start_command(int argc, char **argv) {
         params.security = wlh_protocol_v1_WifiSecurity_WIFI_SECURITY_OPEN;
     }
     xSemaphoreTake(console_app->command_lock, portMAX_DELAY);
+    (void)xSemaphoreTake(console_app->operation_done, 0);
+    console_app->pending_operation = WLH_APP_OP_AP_START;
     submitted = wlh_host_wifi_start_ap(&console_app->host, &params,
                                        command_completion, &wait);
-    result = wait_for_command(&wait, submitted);
+    result = wait_for_operation(&wait, submitted, 10000u);
     xSemaphoreGive(console_app->command_lock);
     delete_wait(&wait);
     return result;
@@ -186,9 +213,11 @@ static int ap_stop_command(int argc, char **argv) {
     (void)argv;
     if (wait.done == NULL) return 1;
     xSemaphoreTake(console_app->command_lock, portMAX_DELAY);
+    (void)xSemaphoreTake(console_app->operation_done, 0);
+    console_app->pending_operation = WLH_APP_OP_AP_STOP;
     submitted =
         wlh_host_wifi_stop_ap(&console_app->host, command_completion, &wait);
-    result = wait_for_command(&wait, submitted);
+    result = wait_for_operation(&wait, submitted, 10000u);
     xSemaphoreGive(console_app->command_lock);
     delete_wait(&wait);
     return result;
@@ -216,8 +245,6 @@ static void register_command(const char *name, const char *help,
 
 void wlh_console_start(wlh_app_t *app) {
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
-    esp_console_dev_uart_config_t uart_config =
-        ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
     console_app = app;
     repl_config.prompt = "wlh> ";
     repl_config.max_cmdline_length = 256u;
@@ -233,8 +260,21 @@ void wlh_console_start(wlh_app_t *app) {
     register_command("ap_stop", "stop SoftAP", ap_stop_command);
     register_command("ping", "ping [hostname], default baidu.com",
                      ping_command);
+#if defined(CONFIG_ESP_CONSOLE_UART_DEFAULT) ||                                \
+    defined(CONFIG_ESP_CONSOLE_UART_CUSTOM)
+    esp_console_dev_uart_config_t uart_config =
+        ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(
         esp_console_new_repl_uart(&uart_config, &repl_config, &repl));
+#elif defined(CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG)
+    esp_console_dev_usb_serial_jtag_config_t usb_config =
+        ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(
+        esp_console_new_repl_usb_serial_jtag(&usb_config, &repl_config, &repl));
+#else
+    ESP_LOGE(TAG, "no console backend enabled");
+    return;
+#endif
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
     ESP_LOGI(TAG, "console ready");
 }

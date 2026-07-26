@@ -131,12 +131,25 @@ void wlh_app_on_event(void *context, const wlh_host_event_t *event) {
         break;
     case WLH_HOST_EVENT_WIFI_SCAN_COMPLETED:
         ESP_LOGI(TAG, "scan complete");
+        if (app->scan_done != NULL) xSemaphoreGive(app->scan_done);
         break;
     case WLH_HOST_EVENT_WIFI_CONNECTED:
         handle_connected(event);
+        if (app->pending_operation == WLH_APP_OP_CONNECT ||
+            app->pending_operation == WLH_APP_OP_AP_START) {
+            app->pending_operation = WLH_APP_OP_NONE;
+            if (app->operation_done != NULL)
+                xSemaphoreGive(app->operation_done);
+        }
         break;
     case WLH_HOST_EVENT_WIFI_DISCONNECTED:
         handle_disconnected(event);
+        if (app->pending_operation == WLH_APP_OP_DISCONNECT ||
+            app->pending_operation == WLH_APP_OP_AP_STOP) {
+            app->pending_operation = WLH_APP_OP_NONE;
+            if (app->operation_done != NULL)
+                xSemaphoreGive(app->operation_done);
+        }
         break;
     case WLH_HOST_EVENT_ETHERNET_STA_RX:
         wlh_network_input(false, event->payload, event->payload_size);
@@ -173,10 +186,14 @@ void app_main(void) {
     memset(&g_wlh_app, 0, sizeof(g_wlh_app));
     g_wlh_app.executor_queue = xQueueCreate(32u, sizeof(wlh_app_task_t));
     g_wlh_app.command_lock = xSemaphoreCreateMutex();
+    g_wlh_app.scan_done = xSemaphoreCreateBinary();
+    g_wlh_app.operation_done = xSemaphoreCreateBinary();
     configASSERT(g_wlh_app.executor_queue != NULL);
     configASSERT(g_wlh_app.command_lock != NULL);
+    configASSERT(g_wlh_app.scan_done != NULL);
+    configASSERT(g_wlh_app.operation_done != NULL);
     configASSERT(xTaskCreate(executor_task_main, "wlh-executor", 4096u,
-                             &g_wlh_app, 5, NULL) == pdPASS);
+                             &g_wlh_app, 8, NULL) == pdPASS);
 
     wlh_freertos_osal_init(&g_wlh_app.freertos_osal);
     configASSERT(wlh_sdio_transport_init(&g_wlh_app.host) == 0);
@@ -193,7 +210,7 @@ void app_main(void) {
     config.max_pending_rpc = 8u;
     config.core_queue_depth = 16u;
     config.stop_timeout_ms = 3000u;
-    config.core_task = (wlh_osal_task_attributes_t){"wlh-host-core", 8192u, 6};
+    config.core_task = (wlh_osal_task_attributes_t){"wlh-host-core", 8192u, 7};
 
     configASSERT(wlh_host_init(&g_wlh_app.host, &config) == WLH_HOST_OK);
     ESP_ERROR_CHECK(wlh_network_init(&g_wlh_app.host));

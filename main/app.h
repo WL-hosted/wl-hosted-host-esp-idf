@@ -14,11 +14,22 @@ typedef struct wlh_app_task {
     void *context;
 } wlh_app_task_t;
 
+typedef enum wlh_app_operation {
+    WLH_APP_OP_NONE,
+    WLH_APP_OP_CONNECT,
+    WLH_APP_OP_DISCONNECT,
+    WLH_APP_OP_AP_START,
+    WLH_APP_OP_AP_STOP,
+} wlh_app_operation_t;
+
 typedef struct wlh_app {
     wlh_host_t host;
     wlh_freertos_osal_t freertos_osal;
     QueueHandle_t executor_queue;
     SemaphoreHandle_t command_lock;
+    SemaphoreHandle_t scan_done;
+    SemaphoreHandle_t operation_done;
+    wlh_app_operation_t pending_operation;
     bool wifi_initialized;
 } wlh_app_t;
 
