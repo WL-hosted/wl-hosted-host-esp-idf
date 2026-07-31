@@ -10,6 +10,7 @@
 #include "freertos/semphr.h"
 #include "iperf_controller.h"
 #include "network.h"
+#include "ota_command.h"
 #include "wifi.pb.h"
 
 typedef struct command_wait {
@@ -582,6 +583,7 @@ void wlh_console_start(wlh_app_t *app) {
     console_app = app;
     repl_config.prompt = "wlh> ";
     repl_config.max_cmdline_length = 256u;
+    repl_config.task_stack_size = 8192u;
     esp_console_register_help_command();
     register_command("status", "show link and IP diagnostics", status_command);
     register_command("scan", "scan nearby Wi-Fi networks", scan_command);
@@ -606,6 +608,7 @@ void wlh_console_start(wlh_app_t *app) {
     register_command("kv_read", "kv_read <key>", kv_read_command);
     register_command("kv_write", "kv_write <key> <value>", kv_write_command);
     register_command("kv_erase", "kv_erase <key>", kv_erase_command);
+    wlh_ota_command_register(app);
 #if defined(CONFIG_ESP_CONSOLE_UART_DEFAULT) ||                                \
     defined(CONFIG_ESP_CONSOLE_UART_CUSTOM)
     esp_console_dev_uart_config_t uart_config =

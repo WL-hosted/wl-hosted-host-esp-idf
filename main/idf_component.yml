@@ -1,3 +1,5 @@
 dependencies:
   espressif/iperf:
     version: "1.0.2"
+  joltwallet/littlefs:
+    version: "^1.22"

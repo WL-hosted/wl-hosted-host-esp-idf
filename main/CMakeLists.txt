@@ -3,6 +3,7 @@ set(wlh_sources
     "console_commands.c"
     "iperf_controller.c"
     "network.c"
+    "ota_command.c"
     "sdio_transport.c"
 )
 
@@ -14,9 +15,12 @@ idf_component_register(
         esp_driver_gpio
         esp_driver_sdmmc
         esp_event
+        esp_http_client
         esp_netif
         iperf
+        joltwallet__littlefs
         lwip
+        mbedtls
         nvs_flash
 )
 

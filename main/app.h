@@ -29,6 +29,7 @@ typedef struct wlh_app {
     SemaphoreHandle_t command_lock;
     SemaphoreHandle_t scan_done;
     SemaphoreHandle_t operation_done;
+    SemaphoreHandle_t ota_credit_ready;
     wlh_app_operation_t pending_operation;
     bool wifi_initialized;
 } wlh_app_t;

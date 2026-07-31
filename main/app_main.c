@@ -8,6 +8,7 @@
 #include "esp_netif.h"
 #include "iperf_controller.h"
 #include "nvs_flash.h"
+#include "ota.pb.h"
 #include "pb_decode.h"
 #include "sdio_transport.h"
 #include "wifi.pb.h"
@@ -41,6 +42,13 @@ static int executor_post(void *context, wlh_task_fn function,
     wlh_app_t *app = context;
     wlh_app_task_t task = {function, task_context};
     return xQueueSend(app->executor_queue, &task, 0) == pdTRUE ? 0 : -1;
+}
+
+/* Fired on the Core task with internal locks held when OTA_STREAM credit
+ * transitions from zero to positive. Only signal; never call back into Core. */
+static void ota_stream_tx_ready(void *context) {
+    wlh_app_t *app = context;
+    xSemaphoreGive(app->ota_credit_ready);
 }
 
 static void initialize_completion(void *context, wlh_host_result_t result,
@@ -166,6 +174,17 @@ void wlh_app_on_event(void *context, const wlh_host_event_t *event) {
     case WLH_HOST_EVENT_WIFI_AP_CLIENT_LEFT:
         ESP_LOGI(TAG, "SoftAP client left");
         break;
+    case WLH_HOST_EVENT_OTA_PROGRESS: {
+        wlh_protocol_v1_OtaProgressEvent progress =
+            wlh_protocol_v1_OtaProgressEvent_init_zero;
+        pb_istream_t input =
+            pb_istream_from_buffer(event->payload, event->payload_size);
+        if (pb_decode(&input, wlh_protocol_v1_OtaProgressEvent_fields,
+                      &progress))
+            ESP_LOGI(TAG, "coproc OTA: state=%d received=%llu", progress.state,
+                     (unsigned long long)progress.bytes_received);
+        break;
+    }
     case WLH_HOST_EVENT_PROTOCOL_FAULT:
         ESP_LOGE(TAG, "protocol fault");
         break;
@@ -191,10 +210,12 @@ void app_main(void) {
     g_wlh_app.command_lock = xSemaphoreCreateMutex();
     g_wlh_app.scan_done = xSemaphoreCreateBinary();
     g_wlh_app.operation_done = xSemaphoreCreateBinary();
+    g_wlh_app.ota_credit_ready = xSemaphoreCreateBinary();
     configASSERT(g_wlh_app.executor_queue != NULL);
     configASSERT(g_wlh_app.command_lock != NULL);
     configASSERT(g_wlh_app.scan_done != NULL);
     configASSERT(g_wlh_app.operation_done != NULL);
+    configASSERT(g_wlh_app.ota_credit_ready != NULL);
     configASSERT(xTaskCreate(executor_task_main, "wlh-executor", 4096u,
                              &g_wlh_app, 8, NULL) == pdPASS);
 
@@ -207,6 +228,8 @@ void app_main(void) {
     config.executor = (wlh_executor_ops_t){&g_wlh_app, executor_post};
     config.on_event = wlh_app_on_event;
     config.event_context = &g_wlh_app;
+    config.ota_stream_tx_ready = ota_stream_tx_ready;
+    config.ota_context = &g_wlh_app;
     config.max_frame_size = WLH_SDIO_MAX_FRAME_SIZE;
     config.rpc_timeout_ms = 10000u;
     config.heartbeat_timeout_ms = 5000u;
