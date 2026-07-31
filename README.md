@@ -41,7 +41,8 @@ idf.py -p /dev/your-port flash monitor
 
 ## Console MVP
 
-The UART console runs at 115200 baud. Type `help` to list commands:
+The console runs on the backend selected in `sdkconfig` (USB Serial/JTAG by
+default; UART at 115200 baud when enabled). Type `help` to list commands:
 
 ```text
 status
@@ -68,6 +69,15 @@ The `io_*` and `adc_read` pin numbers are logical profile pins, not GPIO
 numbers; the coprocessor README lists the mapping for each target. `io_write`
 requires the pin to have been configured as `out` or `od` first, and `kv_write`
 persists the value on the coprocessor across resets.
+
+A single input line may contain several commands separated by unquoted `;` or
+newline characters; they run in order and a failing command does not stop the
+rest. Semicolons inside double quotes are literal, e.g.
+`kv_write key "a;b"`. Example:
+
+```text
+wlh> io_config 4 out; io_write 4 1; io_read 4
+```
 
 `ping` defaults to `baidu.com` and sends four ICMP echo requests. Station mode
 uses an lwIP DHCP client. SoftAP creates a separate Ethernet netif at

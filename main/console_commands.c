@@ -1,17 +1,39 @@
 #include "app.h"
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
+#include "esp_check.h"
 #include "esp_console.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "iperf_controller.h"
+#include "linenoise/linenoise.h"
 #include "network.h"
 #include "ota_command.h"
 #include "wifi.pb.h"
+
+#if defined(CONFIG_ESP_CONSOLE_UART_DEFAULT) ||                                \
+    defined(CONFIG_ESP_CONSOLE_UART_CUSTOM)
+#include "driver/uart.h"
+#include "driver/uart_vfs.h"
+#include "soc/soc_caps.h"
+#elif defined(CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG)
+#include "driver/usb_serial_jtag.h"
+#include "driver/usb_serial_jtag_vfs.h"
+#endif
+
+#define CONSOLE_PROMPT "wlh> "
+#define CONSOLE_MAX_CMDLINE_LENGTH 256u
+#define CONSOLE_MAX_CMDLINE_ARGS 16u
+#define CONSOLE_TASK_STACK_SIZE 8192u
+#define CONSOLE_TASK_PRIORITY 2u
+#define CONSOLE_HISTORY_MAX_LEN 100
 
 typedef struct command_wait {
     SemaphoreHandle_t done;
@@ -30,7 +52,6 @@ typedef struct command_wait {
 
 static const char *TAG = "wlh-console";
 static wlh_app_t *console_app;
-static esp_console_repl_t *repl;
 
 static void command_completion(void *context, wlh_host_result_t result,
                                uint16_t domain, int16_t status,
@@ -578,12 +599,126 @@ static void register_command(const char *name, const char *help,
     ESP_ERROR_CHECK(esp_console_cmd_register(&command));
 }
 
+static esp_err_t console_peripheral_init(void) {
+    fflush(stdout);
+    fsync(fileno(stdout));
+#if defined(CONFIG_ESP_CONSOLE_UART_DEFAULT) ||                                \
+    defined(CONFIG_ESP_CONSOLE_UART_CUSTOM)
+    /* Terminal programs send CR when ENTER is pressed. */
+    uart_vfs_dev_port_set_rx_line_endings(CONFIG_ESP_CONSOLE_UART_NUM,
+                                          ESP_LINE_ENDINGS_CR);
+    uart_vfs_dev_port_set_tx_line_endings(CONFIG_ESP_CONSOLE_UART_NUM,
+                                          ESP_LINE_ENDINGS_CRLF);
+    const uart_config_t uart_config = {
+        .baud_rate = CONFIG_ESP_CONSOLE_UART_BAUDRATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+#if SOC_UART_SUPPORT_REF_TICK
+        .source_clk = UART_SCLK_REF_TICK,
+#elif SOC_UART_SUPPORT_XTAL_CLK
+        .source_clk = UART_SCLK_XTAL,
+#endif
+    };
+    ESP_RETURN_ON_ERROR(
+        uart_driver_install(CONFIG_ESP_CONSOLE_UART_NUM, 256, 0, 0, NULL, 0),
+        TAG, "uart driver install failed");
+    ESP_RETURN_ON_ERROR(uart_param_config(CONFIG_ESP_CONSOLE_UART_NUM,
+                                          &uart_config),
+                        TAG, "uart param config failed");
+    uart_vfs_dev_use_driver(CONFIG_ESP_CONSOLE_UART_NUM);
+#elif defined(CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG)
+    /* Terminal programs send CR when ENTER is pressed. */
+    usb_serial_jtag_vfs_set_rx_line_endings(ESP_LINE_ENDINGS_CR);
+    usb_serial_jtag_vfs_set_tx_line_endings(ESP_LINE_ENDINGS_CRLF);
+    fcntl(fileno(stdout), F_SETFL, 0);
+    fcntl(fileno(stdin), F_SETFL, 0);
+    usb_serial_jtag_driver_config_t jtag_config = {
+        .tx_buffer_size = 256,
+        .rx_buffer_size = 256,
+    };
+    ESP_RETURN_ON_ERROR(usb_serial_jtag_driver_install(&jtag_config), TAG,
+                        "usb-serial-jtag driver install failed");
+    usb_serial_jtag_vfs_use_driver();
+#else
+    ESP_LOGE(TAG, "no console backend enabled");
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+    setvbuf(stdin, NULL, _IONBF, 0);
+    return ESP_OK;
+}
+
+static void console_library_init(void) {
+    const esp_console_config_t console_config = {
+        .max_cmdline_length = CONSOLE_MAX_CMDLINE_LENGTH,
+        .max_cmdline_args = CONSOLE_MAX_CMDLINE_ARGS,
+    };
+    ESP_ERROR_CHECK(esp_console_init(&console_config));
+    linenoiseSetMultiLine(1);
+    linenoiseSetCompletionCallback(&esp_console_get_completion);
+    linenoiseSetHintsCallback((linenoiseHintsCallback *)&esp_console_get_hint);
+    linenoiseHistorySetMaxLen(CONSOLE_HISTORY_MAX_LEN);
+    linenoiseSetMaxLineLen(CONSOLE_MAX_CMDLINE_LENGTH);
+    linenoiseAllowEmpty(false);
+    if (linenoiseProbe() != 0) linenoiseSetDumbMode(1);
+}
+
+static void run_segment(const char *segment) {
+    int ret = 0;
+    esp_err_t err = esp_console_run(segment, &ret);
+    if (err == ESP_ERR_NOT_FOUND) {
+        printf("Unrecognized command\n");
+    } else if (err == ESP_ERR_INVALID_ARG) {
+        /* Empty or whitespace-only segment, e.g. "a;;b"; ignored. */
+    } else if (err != ESP_OK) {
+        printf("Internal error: %s\n", esp_err_to_name(err));
+    } else if (ret != 0) {
+        printf("command failed: %d\n", ret);
+    }
+}
+
+/* Splits the line in place on unquoted ';' and '\n' and runs each segment.
+ * Double quotes suppress splitting; '\"' does not toggle the quote state,
+ * matching esp_console_split_argv(). An unterminated quote leaves the
+ * remainder as one segment. Failed segments do not stop later ones. */
+static void dispatch_segments(char *line) {
+    char *segment = line;
+    char *cursor = line;
+    bool in_quotes = false;
+    bool escaped = false;
+    for (;;) {
+        char character = *cursor;
+        if (character == '"' && !escaped) in_quotes = !in_quotes;
+        escaped = character == '\\' && !escaped;
+        if (character == '\0' ||
+            (!in_quotes && (character == ';' || character == '\n'))) {
+            *cursor = '\0';
+            run_segment(segment);
+            if (character == '\0') return;
+            segment = cursor + 1;
+        }
+        ++cursor;
+    }
+}
+
+static void console_task(void *arg) {
+    (void)arg;
+    for (;;) {
+        char *line = linenoise(CONSOLE_PROMPT);
+        if (line == NULL) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        if (line[0] != '\0') linenoiseHistoryAdd(line);
+        dispatch_segments(line);
+        linenoiseFree(line);
+    }
+}
+
 void wlh_console_start(wlh_app_t *app) {
-    esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
     console_app = app;
-    repl_config.prompt = "wlh> ";
-    repl_config.max_cmdline_length = 256u;
-    repl_config.task_stack_size = 8192u;
+    if (console_peripheral_init() != ESP_OK) return;
+    console_library_init();
     esp_console_register_help_command();
     register_command("status", "show link and IP diagnostics", status_command);
     register_command("scan", "scan nearby Wi-Fi networks", scan_command);
@@ -609,21 +744,10 @@ void wlh_console_start(wlh_app_t *app) {
     register_command("kv_write", "kv_write <key> <value>", kv_write_command);
     register_command("kv_erase", "kv_erase <key>", kv_erase_command);
     wlh_ota_command_register(app);
-#if defined(CONFIG_ESP_CONSOLE_UART_DEFAULT) ||                                \
-    defined(CONFIG_ESP_CONSOLE_UART_CUSTOM)
-    esp_console_dev_uart_config_t uart_config =
-        ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(
-        esp_console_new_repl_uart(&uart_config, &repl_config, &repl));
-#elif defined(CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG)
-    esp_console_dev_usb_serial_jtag_config_t usb_config =
-        ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(
-        esp_console_new_repl_usb_serial_jtag(&usb_config, &repl_config, &repl));
-#else
-    ESP_LOGE(TAG, "no console backend enabled");
-    return;
-#endif
-    ESP_ERROR_CHECK(esp_console_start_repl(repl));
+    if (xTaskCreate(console_task, "wlh_console", CONSOLE_TASK_STACK_SIZE, NULL,
+                    CONSOLE_TASK_PRIORITY, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "console task create failed");
+        return;
+    }
     ESP_LOGI(TAG, "console ready");
 }

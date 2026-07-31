@@ -14,6 +14,8 @@ idf_component_register(
         console
         esp_driver_gpio
         esp_driver_sdmmc
+        esp_driver_uart
+        esp_driver_usb_serial_jtag
         esp_event
         esp_http_client
         esp_netif
@@ -22,6 +24,7 @@ idf_component_register(
         lwip
         mbedtls
         nvs_flash
+        vfs
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wall -Werror)
