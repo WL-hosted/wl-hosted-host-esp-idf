@@ -17,5 +17,6 @@ void wlh_network_ap_down(void);
 void wlh_network_input(bool ap, const uint8_t *frame, size_t size);
 void wlh_network_print_status(void);
 esp_err_t wlh_network_ping(const char *hostname, uint32_t count);
+bool wlh_network_get_sta_ipv4(esp_ip4_addr_t *address);
 
 #endif

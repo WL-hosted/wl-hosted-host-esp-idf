@@ -6,6 +6,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "iperf_controller.h"
 #include "nvs_flash.h"
 #include "pb_decode.h"
 #include "sdio_transport.h"
@@ -110,8 +111,10 @@ static void handle_disconnected(const wlh_host_event_t *event) {
     if (disconnected.interface ==
         wlh_protocol_v1_WifiInterface_WIFI_INTERFACE_AP)
         wlh_network_ap_down();
-    else
+    else {
         wlh_network_sta_down();
+        wlh_iperf_cancel("station link disconnected");
+    }
 }
 
 void wlh_app_on_event(void *context, const wlh_host_event_t *event) {
@@ -214,6 +217,7 @@ void app_main(void) {
 
     configASSERT(wlh_host_init(&g_wlh_app.host, &config) == WLH_HOST_OK);
     ESP_ERROR_CHECK(wlh_network_init(&g_wlh_app.host));
+    ESP_ERROR_CHECK(wlh_iperf_init());
     wlh_console_start(&g_wlh_app);
     configASSERT(wlh_host_start(&g_wlh_app.host) == WLH_HOST_OK);
     ESP_LOGI(TAG, "ESP32-P4 Host started; use 'help' for console commands");

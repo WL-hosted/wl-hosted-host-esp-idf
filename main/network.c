@@ -155,6 +155,16 @@ void wlh_network_print_status(void) {
            (unsigned long)sta_rx_frames, (unsigned long)ap_rx_frames);
 }
 
+bool wlh_network_get_sta_ipv4(esp_ip4_addr_t *address) {
+    esp_netif_ip_info_t info;
+    if (address == NULL || sta_netif == NULL ||
+        !esp_netif_is_netif_up(sta_netif) ||
+        esp_netif_get_ip_info(sta_netif, &info) != ESP_OK || info.ip.addr == 0u)
+        return false;
+    *address = info.ip;
+    return true;
+}
+
 static void ping_success(esp_ping_handle_t handle, void *context) {
     uint32_t sequence;
     uint32_t time_ms;

@@ -1,6 +1,7 @@
 set(wlh_sources
     "app_main.c"
     "console_commands.c"
+    "iperf_controller.c"
     "network.c"
     "sdio_transport.c"
 )
@@ -14,6 +15,7 @@ idf_component_register(
         esp_driver_sdmmc
         esp_event
         esp_netif
+        iperf
         lwip
         nvs_flash
 )

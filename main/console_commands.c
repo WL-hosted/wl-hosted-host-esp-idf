@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "iperf_controller.h"
 #include "network.h"
 #include "wifi.pb.h"
 
@@ -282,6 +283,70 @@ static int ping_command(int argc, char **argv) {
     return 0;
 }
 
+static bool parse_u32_range(const char *text, uint32_t minimum,
+                            uint32_t maximum, uint32_t *value) {
+    char *end = NULL;
+    unsigned long parsed;
+    if (text == NULL || value == NULL) return false;
+    parsed = strtoul(text, &end, 10);
+    if (end == text || *end != '\0' || parsed < minimum || parsed > maximum)
+        return false;
+    *value = (uint32_t)parsed;
+    return true;
+}
+
+static int iperf_command(int argc, char **argv) {
+    wlh_iperf_request_t request = {
+        .duration_sec = 30u,
+        .target_mbps = 20u,
+    };
+    wlh_host_diagnostics_t diagnostics;
+    esp_err_t result;
+    bool client;
+
+    if (argc < 3 ||
+        (strcmp(argv[1], "tcp") != 0 && strcmp(argv[1], "udp") != 0) ||
+        (strcmp(argv[2], "client") != 0 && strcmp(argv[2], "server") != 0)) {
+        printf("usage: iperf tcp client <IPv4> [duration_sec] | tcp server "
+               "[duration_sec] | udp client <IPv4> [duration_sec] [mbps] | "
+               "udp server [duration_sec]\n");
+        return 1;
+    }
+    request.protocol =
+        strcmp(argv[1], "tcp") == 0 ? WLH_IPERF_TCP : WLH_IPERF_UDP;
+    client = strcmp(argv[2], "client") == 0;
+    request.role = client ? WLH_IPERF_CLIENT : WLH_IPERF_SERVER;
+    if (client) {
+        if (argc < 4 || argc > (request.protocol == WLH_IPERF_UDP ? 6 : 5))
+            goto usage;
+        request.peer = argv[3];
+        if ((argc >= 5 &&
+             !parse_u32_range(argv[4], 1u, 300u, &request.duration_sec)) ||
+            (request.protocol == WLH_IPERF_UDP && argc == 6 &&
+             !parse_u32_range(argv[5], 1u, 100u, &request.target_mbps)))
+            goto usage;
+    } else {
+        if (argc > 4 || (argc == 4 && !parse_u32_range(argv[3], 1u, 300u,
+                                                       &request.duration_sec)))
+            goto usage;
+    }
+    wlh_host_get_diagnostics(&console_app->host, &diagnostics);
+    if (diagnostics.state != WLH_HOST_STATE_READY) {
+        printf("iperf unavailable: host is not ready\n");
+        return 1;
+    }
+    result = wlh_iperf_start(&request);
+    if (result != ESP_OK) {
+        printf("iperf start failed: %s\n", esp_err_to_name(result));
+        return 1;
+    }
+    return 0;
+
+usage:
+    printf("invalid iPerf duration or rate\n");
+    return 1;
+}
+
 static const char *io_mode_name(wlh_host_io_mode_t mode) {
     switch (mode) {
     case WLH_HOST_IO_MODE_INPUT:
@@ -529,6 +594,9 @@ void wlh_console_start(wlh_app_t *app) {
     register_command("ap_stop", "stop SoftAP", ap_stop_command);
     register_command("ping", "ping [hostname], default baidu.com",
                      ping_command);
+    register_command("iperf",
+                     "iperf tcp|udp client|server; use help iperf for syntax",
+                     iperf_command);
     register_command("io_config",
                      "io_config <pin> <in|out|od> [none|up|down] [0|1]",
                      io_config_command);
