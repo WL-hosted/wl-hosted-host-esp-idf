@@ -1,6 +1,7 @@
 set(wlh_sources
     "app_main.c"
     "console_commands.c"
+    "iperf2.c"
     "iperf_controller.c"
     "network.c"
     "ota_command.c"
@@ -19,6 +20,7 @@ idf_component_register(
         esp_event
         esp_http_client
         esp_netif
+        esp_timer
         iperf
         joltwallet__littlefs
         lwip

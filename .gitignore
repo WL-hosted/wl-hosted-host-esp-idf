@@ -4,3 +4,4 @@ sdkconfig.old
 managed_components/
 dependencies.lock.*
 !dependencies.lock.esp32p4
+log/

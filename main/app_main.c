@@ -216,7 +216,11 @@ void app_main(void) {
     configASSERT(g_wlh_app.scan_done != NULL);
     configASSERT(g_wlh_app.operation_done != NULL);
     configASSERT(g_wlh_app.ota_credit_ready != NULL);
-    configASSERT(xTaskCreate(executor_task_main, "wlh-executor", 4096u,
+    /* Ethernet RX callbacks enter esp_netif_receive() and tcpip_input() from
+       this executor.  That native lwIP call chain exceeds 4 KiB under
+       sustained TCP ACK traffic (and the overflow corrupts unrelated
+       FreeRTOS lists before the canary is necessarily checked). */
+    configASSERT(xTaskCreate(executor_task_main, "wlh-executor", 8192u,
                              &g_wlh_app, 8, NULL) == pdPASS);
 
     wlh_freertos_osal_init(&g_wlh_app.freertos_osal);
@@ -236,7 +240,11 @@ void app_main(void) {
     config.max_pending_rpc = 8u;
     config.core_queue_depth = 16u;
     config.stop_timeout_ms = 3000u;
-    config.core_task = (wlh_osal_task_attributes_t){"wlh-host-core", 8192u, 7};
+    /* Sustained TCP TX reaches the full Core encode/transport admission path
+       from this worker.  ESP32-P4's FreeRTOS, heap, logging, and SDIO adapter
+       call depth exceeds the former 8 KiB budget and corrupts adjacent heap
+       metadata before the overflow hook can always identify the task. */
+    config.core_task = (wlh_osal_task_attributes_t){"wlh-host-core", 16384u, 7};
 
     configASSERT(wlh_host_init(&g_wlh_app.host, &config) == WLH_HOST_OK);
     ESP_ERROR_CHECK(wlh_network_init(&g_wlh_app.host));

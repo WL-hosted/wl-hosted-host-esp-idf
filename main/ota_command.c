@@ -33,8 +33,8 @@ static const char *TAG = "wlh-ota";
 /* Largest OTA record payload the host link admits: SDIO frame minus the frame
  * header, the raw-record header, and the 16-byte OTA stream sub-header. Mirrors
  * the check in host_ota.c (size + 16 <= ota_max_record). */
-#define OTA_HOST_CHUNK_LIMIT                                                    \
-    ((uint32_t)(WLH_SDIO_MAX_FRAME_SIZE - WLH_FRAME_HEADER_SIZE -               \
+#define OTA_HOST_CHUNK_LIMIT                                                   \
+    ((uint32_t)(WLH_SDIO_MAX_FRAME_SIZE - WLH_FRAME_HEADER_SIZE -              \
                 WLH_RAW_RECORD_HEADER_SIZE - 16u))
 
 static wlh_app_t *ota_app;
@@ -60,9 +60,10 @@ static void ota_rpc_completion(void *context, wlh_host_result_t result,
     xSemaphoreGive(wait->done);
 }
 
-static void ota_begin_completion(void *context, wlh_host_result_t result,
-                                 uint16_t domain, int16_t status,
-                                 const wlh_host_ota_begin_response_t *response) {
+static void
+ota_begin_completion(void *context, wlh_host_result_t result, uint16_t domain,
+                     int16_t status,
+                     const wlh_host_ota_begin_response_t *response) {
     ota_wait_t *wait = context;
     wait->result = result;
     wait->domain = domain;
@@ -83,7 +84,8 @@ static int ota_wait(ota_wait_t *wait, wlh_host_result_t submitted,
         printf("%s timed out\n", what);
         return 1;
     }
-    if (wait->result != WLH_HOST_OK || wait->domain != 0u || wait->status != 0) {
+    if (wait->result != WLH_HOST_OK || wait->domain != 0u ||
+        wait->status != 0) {
         printf("%s failed: result=%d domain=%u status=%d\n", what, wait->result,
                wait->domain, wait->status);
         return 1;
@@ -101,13 +103,14 @@ static esp_err_t ota_mount_storage(void) {
     };
     esp_err_t err = esp_vfs_littlefs_register(&conf);
     if (err != ESP_OK)
-        ESP_LOGE(TAG, "littlefs mount failed: %s (is 'storage' partition flashed?)",
+        ESP_LOGE(TAG,
+                 "littlefs mount failed: %s (is 'storage' partition flashed?)",
                  esp_err_to_name(err));
     return err;
 }
 
-/* Downloads url into OTA_IMAGE_PATH, returning the byte count and the SHA-256 of
- * the full image. Plain HTTP only. */
+/* Downloads url into OTA_IMAGE_PATH, returning the byte count and the SHA-256
+ * of the full image. Plain HTTP only. */
 static esp_err_t ota_download(const char *url, uint64_t *image_size,
                               uint8_t sha256[32]) {
     if (strncmp(url, "http://", 7) != 0) {
@@ -168,8 +171,8 @@ static esp_err_t ota_download(const char *url, uint64_t *image_size,
     uint64_t last_print = 0u;
     bool magic_checked = false;
     for (;;) {
-        int read = esp_http_client_read(client, (char *)buffer,
-                                        OTA_DOWNLOAD_BUFFER);
+        int read =
+            esp_http_client_read(client, (char *)buffer, OTA_DOWNLOAD_BUFFER);
         if (read < 0) {
             printf("http read error after %llu bytes\n",
                    (unsigned long long)total);
@@ -307,9 +310,8 @@ static void ota_abort_transfer(uint32_t transfer_id) {
     ota_wait_t wait = {0};
     wait.done = xSemaphoreCreateBinary();
     if (wait.done == NULL) return;
-    wlh_host_result_t submitted =
-        wlh_host_ota_abort(&ota_app->host, transfer_id, ota_rpc_completion,
-                           &wait);
+    wlh_host_result_t submitted = wlh_host_ota_abort(
+        &ota_app->host, transfer_id, ota_rpc_completion, &wait);
     if (ota_wait(&wait, submitted, OTA_ABORT_TIMEOUT_MS, "ota abort") != 0)
         ESP_LOGW(TAG, "abort of transfer %lu not confirmed",
                  (unsigned long)transfer_id);
@@ -362,8 +364,8 @@ static int ota_command(int argc, char **argv) {
     params.image_size = image_size;
     memcpy(params.sha256, sha256, sizeof(params.sha256));
     wait.has_begin = false;
-    wlh_host_result_t submitted =
-        wlh_host_ota_begin(&ota_app->host, &params, ota_begin_completion, &wait);
+    wlh_host_result_t submitted = wlh_host_ota_begin(
+        &ota_app->host, &params, ota_begin_completion, &wait);
     if (ota_wait(&wait, submitted, OTA_RPC_TIMEOUT_MS, "ota begin") != 0)
         goto cleanup;
     if (!wait.has_begin) {
@@ -391,7 +393,8 @@ static int ota_command(int argc, char **argv) {
     /* FINALIZE: coprocessor drains its flash queue, then verifies length and
      * SHA-256. A non-zero status means the image was rejected and the
      * coprocessor already released its handle. */
-    wait.result = WLH_HOST_TIMEOUT; /* sentinel: overwritten iff a completion arrives */
+    wait.result =
+        WLH_HOST_TIMEOUT; /* sentinel: overwritten iff a completion arrives */
     submitted = wlh_host_ota_finalize(&ota_app->host, transfer_id, image_size,
                                       ota_rpc_completion, &wait);
     if (ota_wait(&wait, submitted, OTA_RPC_TIMEOUT_MS, "ota finalize") != 0) {
@@ -406,7 +409,7 @@ static int ota_command(int argc, char **argv) {
     /* ACTIVATE with reboot: the coprocessor replies before restarting, then the
      * link drops and host-core re-handshakes on its own. */
     submitted = wlh_host_ota_activate(&ota_app->host, transfer_id, true,
-                                     ota_rpc_completion, &wait);
+                                      ota_rpc_completion, &wait);
     if (ota_wait(&wait, submitted, OTA_RPC_TIMEOUT_MS, "ota activate") != 0)
         goto cleanup;
 

@@ -6,3 +6,24 @@ CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=11520
+CONFIG_LWIP_TCP_WND_DEFAULT=32768
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=48
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=48
+# The native lwIP TX path enters the WL-hosted Core adapter (allocation,
+# mutex, and bounded queue admission) from tcpip_thread. ESP-IDF's 3072-byte
+# default and an initial 6144-byte budget both overflow under sustained
+# full-size TCP output on ESP32-P4.
+CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=12288
+CONFIG_FREERTOS_USE_LIST_DATA_INTEGRITY_CHECK_BYTES=y
+# TODO(wlh-p4-errata): ESP32-P4 rev1.3 corrupts instruction fetches under
+# sustained SDMMC traffic. CPU1 disabled materially improves stability but
+# does not eliminate the fault at the highest CMD53 duty cycle. Remove only
+# after an Espressif fix passes the four-direction P4+SDIO+C6 hardware matrix.
+CONFIG_FREERTOS_UNICORE=y
+CONFIG_ESP_COREDUMP_ENABLE_TO_UART=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
+CONFIG_ESP_COREDUMP_MAX_TASKS_NUM=64
+CONFIG_ESP_COREDUMP_UART_DELAY=0
+CONFIG_LWIP_TCP_SACK_OUT=y

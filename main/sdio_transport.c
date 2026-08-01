@@ -10,10 +10,12 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "sdmmc_cmd.h"
+#include "wlh/protocol/endian.h"
 #include "wlh/protocol/wire.h"
 
 #define WLH_SDIO_CLK_GPIO 54
@@ -33,6 +35,8 @@
 #define WLH_SDIO_TOKEN_MASK 0xfffu
 #define WLH_SDIO_TOKEN_MODULUS 0x1000u
 #define WLH_SDIO_BUFFER_SIZE 4092u
+#define WLH_SDIO_DMA_FRAME_SIZE 4096u
+#define WLH_SDIO_DMA_ALIGNMENT 64u
 #define WLH_SDIO_NEW_PACKET_BIT (1u << 23)
 #define WLH_SDIO_FUNC1_BIT (1u << 1)
 
@@ -51,7 +55,16 @@
 #define WLH_SDIO_FBR_FUNCTION1 0x100u
 
 #define WLH_SDIO_TX_QUEUE_DEPTH 16u
+#define WLH_SDIO_IO_TASK_STACK_SIZE 6144u
 #define WLH_SDIO_INIT_RETRIES 3u
+#define WLH_SDIO_TX_BURST_LIMIT 8u
+#define WLH_SDIO_RX_BURST_LIMIT 8u
+#define WLH_SDIO_IO_IDLE_BIT (1u << 0)
+
+_Static_assert(WLH_SDIO_DMA_FRAME_SIZE % WLH_SDIO_DMA_ALIGNMENT == 0u,
+               "SDIO TX DMA buffer must cover whole cache lines");
+_Static_assert((WLH_SDIO_MAX_FRAME_SIZE + 4u) % WLH_SDIO_DMA_ALIGNMENT == 0u,
+               "SDIO RX DMA buffer must cover whole cache lines");
 
 typedef struct tx_job {
     uint8_t *frame;
@@ -73,7 +86,10 @@ typedef struct sdio_transport {
     QueueHandle_t tx_queue;
     QueueHandle_t lifecycle_queue;
     SemaphoreHandle_t bus_lock;
+    SemaphoreHandle_t io_state_lock;
+    EventGroupHandle_t io_events;
     atomic_bool running;
+    uint32_t active_io;
     bool hardware_initialized;
     uint32_t rx_byte_count;
     uint32_t tx_buffer_count;
@@ -82,8 +98,24 @@ typedef struct sdio_transport {
 static const char *TAG = "wlh-sdio-host";
 static sdio_transport_t transport;
 
-static uint32_t round_up_4(size_t size) {
-    return (uint32_t)((size + 3u) & ~3u);
+static bool begin_io(void) {
+    bool admitted = false;
+    xSemaphoreTake(transport.io_state_lock, portMAX_DELAY);
+    if (atomic_load(&transport.running)) {
+        if (transport.active_io++ == 0u)
+            xEventGroupClearBits(transport.io_events, WLH_SDIO_IO_IDLE_BIT);
+        admitted = true;
+    }
+    xSemaphoreGive(transport.io_state_lock);
+    return admitted;
+}
+
+static void end_io(void) {
+    xSemaphoreTake(transport.io_state_lock, portMAX_DELAY);
+    configASSERT(transport.active_io > 0u);
+    if (--transport.active_io == 0u)
+        xEventGroupSetBits(transport.io_events, WLH_SDIO_IO_IDLE_BIT);
+    xSemaphoreGive(transport.io_state_lock);
 }
 
 static esp_err_t read_register(uint32_t address, void *data, size_t size) {
@@ -223,8 +255,15 @@ fail:
 }
 
 static void hardware_stop(void) {
+    xSemaphoreTake(transport.io_state_lock, portMAX_DELAY);
     atomic_store(&transport.running, false);
+    xSemaphoreGive(transport.io_state_lock);
     if (!transport.hardware_initialized) return;
+    /* sdmmc_host_deinit_slot is not safe while another task is blocked in
+       sdmmc_io_wait_int or executing CMD52/CMD53. Prevent new operations and
+       wait for every admitted operation to leave the driver first. */
+    xEventGroupWaitBits(transport.io_events, WLH_SDIO_IO_IDLE_BIT, pdFALSE,
+                        pdTRUE, portMAX_DELAY);
     sdmmc_host_deinit_slot(transport.sdmmc.slot);
     transport.hardware_initialized = false;
 }
@@ -292,13 +331,15 @@ static esp_err_t write_data(uint32_t address, const uint8_t *data,
     return ESP_OK;
 }
 
-static esp_err_t write_frame(const uint8_t *frame, size_t size) {
-    uint32_t transfer_size = round_up_4(size);
-    uint8_t *dma_frame =
-        heap_caps_calloc(1u, transfer_size, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+static esp_err_t write_frame(uint8_t *dma_frame, const uint8_t *frame,
+                             size_t size) {
+    uint32_t transfer_size = (uint32_t)((size + WLH_SDIO_BLOCK_SIZE - 1u) &
+                                        ~(WLH_SDIO_BLOCK_SIZE - 1u));
     esp_err_t result;
-    if (dma_frame == NULL) return ESP_ERR_NO_MEM;
+    configASSERT(transfer_size <= WLH_SDIO_DMA_FRAME_SIZE);
+    memset(dma_frame, 0, transfer_size);
     memcpy(dma_frame, frame, size);
+    if (!begin_io()) return ESP_ERR_INVALID_STATE;
     xSemaphoreTake(transport.bus_lock, portMAX_DELAY);
     result = wait_for_tx_buffer();
     if (result == ESP_OK) {
@@ -306,13 +347,22 @@ static esp_err_t write_frame(const uint8_t *frame, size_t size) {
             write_data(WLH_SDIO_END_ADDRESS - size, dma_frame, transfer_size);
     }
     xSemaphoreGive(transport.bus_lock);
-    heap_caps_free(dma_frame);
+    end_io();
     return result;
 }
 
 static void tx_task_main(void *argument) {
+    /* ESP32-P4 SDMMC DMA operates on cache-backed internal L2 RAM. Both the
+       address and transfer extent must cover complete 64-byte cache lines so
+       the driver's C2M/M2C cache synchronization cannot touch neighboring
+       allocations. */
+    uint8_t *dma_frame = heap_caps_aligned_alloc(
+        WLH_SDIO_DMA_ALIGNMENT, WLH_SDIO_DMA_FRAME_SIZE,
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
     tx_job_t job;
+    unsigned burst_frames = 0u;
     (void)argument;
+    configASSERT(dma_frame != NULL);
     for (;;) {
         if (xQueueReceive(transport.tx_queue, &job, portMAX_DELAY) != pdTRUE)
             continue;
@@ -321,16 +371,29 @@ static void tx_task_main(void *argument) {
                            ESP_FAIL);
             continue;
         }
-        esp_err_t result = write_frame(job.frame, job.size);
+        esp_err_t result = write_frame(dma_frame, job.frame, job.size);
         if (result != ESP_OK)
             ESP_LOGW(TAG, "CMD53 TX failed: %s", esp_err_to_name(result));
         job.completion(job.completion_context, job.frame, job.size,
                        (int)result);
+        /* taskYIELD() only hands the CPU to an equal-priority task. Under a
+           sustained stream that leaves both SDIO workers permanently ready
+           and starves the single-core idle task. Bound the work quantum and
+           really block at its boundary; an empty queue resets the quantum. */
+        if (uxQueueMessagesWaiting(transport.tx_queue) == 0u) {
+            burst_frames = 0u;
+        } else if (++burst_frames == WLH_SDIO_TX_BURST_LIMIT) {
+            burst_frames = 0u;
+            vTaskDelay(1u);
+        } else {
+            taskYIELD();
+        }
     }
 }
 
 static esp_err_t read_pending_frame(uint8_t *frame, size_t *frame_size) {
     uint32_t packet_length = 0u;
+    uint32_t raw_packet_length;
     uint32_t interrupt_status = 0u;
     uint32_t size;
     uint32_t transfer_size;
@@ -349,6 +412,7 @@ static esp_err_t read_pending_frame(uint8_t *frame, size_t *frame_size) {
         WLH_SDIO_REG_INT_CLEAR, &interrupt_status, sizeof(interrupt_status));
     if (result != ESP_OK) return result;
     if (clear_result != ESP_OK) return clear_result;
+    raw_packet_length = packet_length;
     packet_length &= WLH_SDIO_LENGTH_MASK;
     size = (packet_length + WLH_SDIO_LENGTH_MODULUS - transport.rx_byte_count) %
            WLH_SDIO_LENGTH_MODULUS;
@@ -356,10 +420,17 @@ static esp_err_t read_pending_frame(uint8_t *frame, size_t *frame_size) {
         size > WLH_SDIO_MAX_FRAME_SIZE) {
         /* Floating bus or lost framing (e.g. slave mid-reset): drop this
            transaction and resynchronize to the slave's counter. */
+        ESP_LOGW(TAG,
+                 "invalid SDIO RX length: raw=0x%08lx previous=%lu "
+                 "delta=%lu max=%u",
+                 (unsigned long)raw_packet_length,
+                 (unsigned long)transport.rx_byte_count, (unsigned long)size,
+                 (unsigned)WLH_SDIO_MAX_FRAME_SIZE);
         transport.rx_byte_count = packet_length;
         return ESP_ERR_INVALID_SIZE;
     }
-    transfer_size = round_up_4(size);
+    transfer_size = (uint32_t)((size + WLH_SDIO_BLOCK_SIZE - 1u) &
+                               ~(WLH_SDIO_BLOCK_SIZE - 1u));
     result = read_data(WLH_SDIO_END_ADDRESS - size, frame, transfer_size);
     if (result != ESP_OK) {
         /* The frame is lost; resynchronize so the next interrupt starts
@@ -373,32 +444,44 @@ static esp_err_t read_pending_frame(uint8_t *frame, size_t *frame_size) {
 }
 
 static void rx_task_main(void *argument) {
-    uint8_t *frame = heap_caps_malloc(WLH_SDIO_MAX_FRAME_SIZE + 4u,
-                                      MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    /* Keep RX under the same cache-line ownership contract as TX. */
+    uint8_t *frame = heap_caps_aligned_alloc(
+        WLH_SDIO_DMA_ALIGNMENT, WLH_SDIO_MAX_FRAME_SIZE + 4u,
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    bool pending = false;
     (void)argument;
     configASSERT(frame != NULL);
     for (;;) {
         esp_err_t result;
+        unsigned burst_frames = 0u;
         size_t size = 0u;
         if (!atomic_load(&transport.running)) {
+            pending = false;
             vTaskDelay(pdMS_TO_TICKS(20u));
             continue;
         }
-        result = sdmmc_io_wait_int(&transport.card, pdMS_TO_TICKS(1000u));
-        if (result == ESP_ERR_TIMEOUT) continue;
-        if (result != ESP_OK) {
-            ESP_LOGW(TAG, "SDIO interrupt wait failed: %s",
-                     esp_err_to_name(result));
-            continue;
+        if (!pending) {
+            if (!begin_io()) continue;
+            result = sdmmc_io_wait_int(&transport.card, pdMS_TO_TICKS(1000u));
+            end_io();
+            if (result == ESP_ERR_TIMEOUT) continue;
+            if (result != ESP_OK) {
+                ESP_LOGW(TAG, "SDIO interrupt wait failed: %s",
+                         esp_err_to_name(result));
+                continue;
+            }
         }
+        pending = false;
         for (;;) {
             /* Drain every queued frame; the slave may have posted more
-               than one transaction per interrupt. Hold the SDIO bus only
-               for one CMD53 transaction so the TX task can return credits
-               between received Ethernet frames. */
+               than one transaction per interrupt. The packet-length register
+               is cumulative, so one read may contain several complete WLH
+               wire frames. */
+            if (!begin_io()) break;
             xSemaphoreTake(transport.bus_lock, portMAX_DELAY);
             result = read_pending_frame(frame, &size);
             xSemaphoreGive(transport.bus_lock);
+            end_io();
             if (result == ESP_ERR_NOT_FOUND) break;
             if (result == ESP_ERR_INVALID_SIZE) {
                 ESP_LOGW(TAG, "dropping invalid SDIO RX transaction");
@@ -426,6 +509,15 @@ static void rx_task_main(void *argument) {
                 if (host_result != WLH_HOST_OK)
                     ESP_LOGW(TAG, "Host Core rejected SDIO frame: %d",
                              (int)host_result);
+            }
+            /* A continuously asserted slave queue must not let this high
+               priority worker monopolize a single-core host. Preserve the
+               pending state after a bounded burst, block for one scheduler
+               tick, then resume draining without relying on a new edge. */
+            if (++burst_frames == WLH_SDIO_RX_BURST_LIMIT) {
+                pending = true;
+                vTaskDelay(1u);
+                break;
             }
         }
     }
@@ -493,18 +585,27 @@ int wlh_sdio_transport_init(wlh_host_t *host) {
         xQueueCreate(WLH_SDIO_TX_QUEUE_DEPTH, sizeof(tx_job_t));
     transport.lifecycle_queue = xQueueCreate(2u, sizeof(lifecycle_job_t));
     transport.bus_lock = xSemaphoreCreateMutex();
+    transport.io_state_lock = xSemaphoreCreateMutex();
+    transport.io_events = xEventGroupCreate();
     if (transport.tx_queue == NULL || transport.lifecycle_queue == NULL ||
-        transport.bus_lock == NULL)
+        transport.bus_lock == NULL || transport.io_state_lock == NULL ||
+        transport.io_events == NULL)
         return -1;
+    xEventGroupSetBits(transport.io_events, WLH_SDIO_IO_IDLE_BIT);
     if (xTaskCreate(lifecycle_task_main, "wlh-sdio-life", 6144u, NULL, 7,
                     NULL) != pdPASS ||
-        /* TX must preempt RX after Host Core queues a CreditUpdate. Otherwise
-           a continuous RX burst can fill the bounded TX queue and permanently
-           lose credits until the coprocessor reaches CONGESTED. */
-        xTaskCreate(tx_task_main, "wlh-sdio-tx", 4096u, NULL, 9, NULL) !=
-            pdPASS ||
-        xTaskCreate(rx_task_main, "wlh-sdio-rx", 4096u, NULL, 6, NULL) !=
-            pdPASS)
+        /* Keep TX and RX at the same priority. Either direction may carry the
+           CreditUpdate required for its peer to continue, so permanently
+           preferring one side can deadlock a saturated bidirectional link. */
+        /* CMD52/CMD53 traverse the ESP-IDF SDMMC command and cache/DMA
+           preparation layers on this task's stack.  The former 4 KiB budget
+           overflows under sustained full-size Ethernet TX; RX executes the
+           same driver stack, so give both bounded I/O workers the measured
+           safe budget rather than relying on the idle-traffic call depth. */
+        xTaskCreate(tx_task_main, "wlh-sdio-tx", WLH_SDIO_IO_TASK_STACK_SIZE,
+                    NULL, 9, NULL) != pdPASS ||
+        xTaskCreate(rx_task_main, "wlh-sdio-rx", WLH_SDIO_IO_TASK_STACK_SIZE,
+                    NULL, 9, NULL) != pdPASS)
         return -1;
     return 0;
 }

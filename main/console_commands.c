@@ -149,6 +149,11 @@ static void delete_wait(command_wait_t *wait) {
 
 static int status_command(int argc, char **argv) {
     wlh_host_diagnostics_t diagnostics;
+    static const char *const task_names[] = {
+        "wlh-host-core", "wlh-executor", "tcpip_thread",
+        "wlh-sdio-tx",   "wlh-sdio-rx",
+    };
+    size_t index;
     (void)argc;
     (void)argv;
     wlh_host_get_diagnostics(&console_app->host, &diagnostics);
@@ -163,6 +168,15 @@ static int status_command(int argc, char **argv) {
            (unsigned long)diagnostics.sequence_gaps,
            (unsigned long)diagnostics.peer_resets);
     wlh_network_print_status();
+    printf("stack free high-water (bytes):");
+    for (index = 0u; index < sizeof(task_names) / sizeof(task_names[0]);
+         ++index) {
+        TaskHandle_t task = xTaskGetHandle(task_names[index]);
+        if (task != NULL)
+            printf(" %s=%lu", task_names[index],
+                   (unsigned long)uxTaskGetStackHighWaterMark(task));
+    }
+    printf("\n");
     return 0;
 }
 
@@ -623,9 +637,9 @@ static esp_err_t console_peripheral_init(void) {
     ESP_RETURN_ON_ERROR(
         uart_driver_install(CONFIG_ESP_CONSOLE_UART_NUM, 256, 0, 0, NULL, 0),
         TAG, "uart driver install failed");
-    ESP_RETURN_ON_ERROR(uart_param_config(CONFIG_ESP_CONSOLE_UART_NUM,
-                                          &uart_config),
-                        TAG, "uart param config failed");
+    ESP_RETURN_ON_ERROR(
+        uart_param_config(CONFIG_ESP_CONSOLE_UART_NUM, &uart_config), TAG,
+        "uart param config failed");
     uart_vfs_dev_use_driver(CONFIG_ESP_CONSOLE_UART_NUM);
 #elif defined(CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG)
     /* Terminal programs send CR when ENTER is pressed. */
