@@ -1,0 +1,26 @@
+# Debug experiment for the tcpip_thread assert crash (see wl-hosted-plan
+# pending/P4_SDIO_C6_TCPIP_THREAD_ASSERT_CRASH_20260802.md): the failure
+# signature is execution-level corruption on ESP32-P4 rev1.3 under SDMMC
+# load (an esp_cache_msync argument check that cannot fail by construction
+# fired inside sdmmc_isr). Move the SDMMC driver and the cache-sync code it
+# calls off the flash instruction-fetch path and into IRAM to test whether
+# the flash-fetch leg is the corruption victim.
+[mapping:sdio_driver_iram]
+archive: libesp_driver_sdmmc.a
+entries:
+    * (noflash)
+
+[mapping:sdio_protocol_iram]
+archive: libsdmmc.a
+entries:
+    * (noflash)
+
+[mapping:esp_cache_msync_iram]
+archive: libesp_mm.a
+entries:
+    esp_cache_msync (noflash)
+
+[mapping:cache_hal_iram]
+archive: libhal.a
+entries:
+    cache_hal (noflash)

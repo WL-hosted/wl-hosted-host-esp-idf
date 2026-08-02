@@ -11,6 +11,7 @@ set(wlh_sources
 idf_component_register(
     SRCS ${wlh_sources}
     INCLUDE_DIRS "."
+    LDFRAGMENTS "linker.lf"
     PRIV_REQUIRES
         console
         esp_driver_gpio
