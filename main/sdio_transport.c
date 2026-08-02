@@ -413,6 +413,15 @@ static esp_err_t read_pending_frame(uint8_t *frame, size_t *frame_size) {
     if (result != ESP_OK) return result;
     if (clear_result != ESP_OK) return clear_result;
     raw_packet_length = packet_length;
+    /* The slave length register must never read all 32 bits set: that is the
+     * SDIO bus-fault signature esp-hosted also detects. A single garbage
+     * sample must not poison rx_byte_count, so bail out of this drain (the
+     * outer loop re-arms on the next interrupt) instead of resynchronizing
+     * to a value that would wedge every later read. */
+    if (raw_packet_length == UINT32_MAX) {
+        ESP_LOGW(TAG, "SDIO PACKET_LEN read fault (0xffffffff)");
+        return ESP_ERR_NOT_FOUND;
+    }
     packet_length &= WLH_SDIO_LENGTH_MASK;
     size = (packet_length + WLH_SDIO_LENGTH_MODULUS - transport.rx_byte_count) %
            WLH_SDIO_LENGTH_MODULUS;
@@ -484,7 +493,15 @@ static void rx_task_main(void *argument) {
             end_io();
             if (result == ESP_ERR_NOT_FOUND) break;
             if (result == ESP_ERR_INVALID_SIZE) {
+                /* A misbehaving or mid-reset slave must not be able to pin
+                   this task in an unbounded drain: charge the transaction to
+                   the burst budget like a successful frame. */
                 ESP_LOGW(TAG, "dropping invalid SDIO RX transaction");
+                if (++burst_frames == WLH_SDIO_RX_BURST_LIMIT) {
+                    pending = true;
+                    vTaskDelay(1u);
+                    break;
+                }
                 continue;
             }
             if (result != ESP_OK) {

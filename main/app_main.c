@@ -239,6 +239,12 @@ void app_main(void) {
     config.heartbeat_timeout_ms = 5000u;
     config.max_pending_rpc = 8u;
     config.core_queue_depth = 16u;
+    /* Aggregate up to 4 queued Ethernet records per wire frame on the
+     * host -> coprocessor path: the coprocessor returns credit per record
+     * and already aggregates its own TX, so this only cuts the per-frame
+     * SDIO transaction count (token read + CMD53) by up to 4x. Bounded by
+     * max_frame_size, so full-size frames pack two per wire frame. */
+    config.ethernet_tx_aggregation_limit = 4u;
     config.stop_timeout_ms = 3000u;
     /* Sustained TCP TX reaches the full Core encode/transport admission path
        from this worker.  ESP32-P4's FreeRTOS, heap, logging, and SDIO adapter
