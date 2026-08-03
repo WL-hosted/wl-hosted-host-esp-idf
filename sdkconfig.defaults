@@ -39,3 +39,6 @@ CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
 # Turn a Task-WDT-detectable hang into panic+coredump instead of a silent
 # reset. Ineffective if the CPU is stalled below the interrupt level.
 CONFIG_ESP_TASK_WDT_PANIC=y
+# Capture the whole DRAM (heap + .bss) into the UART coredump so the next
+# corruption crash shows the damaged objects and their value patterns.
+CONFIG_ESP_COREDUMP_CAPTURE_DRAM=y
