@@ -6,10 +6,15 @@ CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=11520
-CONFIG_LWIP_TCP_WND_DEFAULT=32768
-CONFIG_LWIP_TCP_RECVMBOX_SIZE=48
-CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=48
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65535
+# 65535 is the window limit without LWIP_WND_SCALE (which needs SPIRAM).
+# Measured TCP throughput was window/RTT limited (tcp_tx 4.1 Mbps @ snd_buf
+# 11520, tcp_rx 7.3 Mbps @ wnd 32768); the datapath RTT is 20-40 ms under
+# load, so the full 64 KB window is required for the ~20 Mbps target.
+CONFIG_LWIP_TCP_WND_DEFAULT=65535
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=64
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=16
 # The native lwIP TX path enters the WL-hosted Core adapter (allocation,
 # mutex, and bounded queue admission) from tcpip_thread. ESP-IDF's 3072-byte
 # default and an initial 6144-byte budget both overflow under sustained

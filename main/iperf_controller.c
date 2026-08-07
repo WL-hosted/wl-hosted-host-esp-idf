@@ -19,9 +19,18 @@
 #define WLH_IPERF_MAX_MBPS 100u
 #define WLH_IPERF_PORT 5001u
 #define WLH_IPERF_REPORT_INTERVAL_MS 3000u
-#define WLH_IPERF_UDP_ACK_ATTEMPTS 10u
-#define WLH_IPERF_UDP_ACK_WAIT_MS 250u
+/* iPerf2 servers retransmit the final report for up to ~10 s while they wait
+ * for the client to stop re-sending FIN datagrams, and the WL-hosted TX path
+ * can hold a multi-second backlog at the moment the data phase ends. The
+ * client must outlive that window; each attempt re-sends the FIN, which is
+ * also what keeps a server that missed the first FIN retransmitting. */
+#define WLH_IPERF_UDP_ACK_ATTEMPTS 20u
+#define WLH_IPERF_UDP_ACK_WAIT_MS 500u
 #define WLH_IPERF_CUSTOM_INSTANCE_ID 1
+/* The UDP session task must outrank the SDIO workers and the executor so it
+ * keeps draining the tiny per-socket receive mbox during a firehose burst;
+ * otherwise lwIP drops datagrams on a full mbox and the loss reports lie. */
+#define WLH_IPERF_UDP_TASK_PRIORITY 12u
 
 typedef struct wlh_iperf_controller {
     SemaphoreHandle_t mutex;
@@ -79,6 +88,8 @@ static bool udp_cancelled(void) {
     return cancelled;
 }
 
+static bool udp_send_backpressured(void);
+
 static bool send_udp_server_report(int socket, const struct sockaddr_in *peer,
                                    socklen_t peer_size, uint64_t elapsed_ms,
                                    const wlh_iperf2_udp_stats_t *stats,
@@ -93,7 +104,16 @@ static bool send_udp_server_report(int socket, const struct sockaddr_in *peer,
          ++attempt) {
         int sent = lwip_sendto(socket, report, sizeof(report), 0,
                                (const struct sockaddr *)peer, peer_size);
-        if (sent != (int)sizeof(report)) return false;
+        if (sent != (int)sizeof(report)) {
+            /* A momentarily full TX path must not cost the client its final
+               report: wait and retry the way the client's FIN loop does. */
+            if (udp_send_backpressured()) {
+                vTaskDelay(1u);
+                continue;
+            }
+            ESP_LOGW(TAG, "UDP server report send failed: errno=%d", errno);
+            return false;
+        }
         /* iPerf2 retransmits its FIN while it waits for this report.  Drain
          * one such retransmission before sending the next copy. */
         if (lwip_recvfrom(socket, received, sizeof(received), 0, NULL, NULL) <
@@ -255,15 +275,21 @@ static void udp_client_task_main(void *argument) {
             .microseconds = (uint32_t)(now_us % 1000000u),
         };
         wlh_iperf2_udp_encode(packet, &final);
-        for (attempt = 0u; attempt < WLH_IPERF_UDP_ACK_ATTEMPTS; ++attempt) {
-            if (lwip_send(socket, packet, sizeof(packet), 0) !=
-                (int)sizeof(packet)) {
-                if (udp_send_backpressured()) continue;
-                break;
-            }
-            if (lwip_recv(socket, report, sizeof(report), 0) > 0) {
-                report_received = true;
-                break;
+        {
+            bool send_failure_logged = false;
+            for (attempt = 0u;
+                 attempt < WLH_IPERF_UDP_ACK_ATTEMPTS && !udp_cancelled();
+                 ++attempt) {
+                if (lwip_send(socket, packet, sizeof(packet), 0) ==
+                    (int)sizeof(packet)) {
+                    if (lwip_recv(socket, report, sizeof(report), 0) > 0) {
+                        report_received = true;
+                        break;
+                    }
+                } else if (!send_failure_logged) {
+                    ESP_LOGW(TAG, "UDP FIN send failed: errno=%d", errno);
+                    send_failure_logged = true;
+                }
             }
         }
         if (!report_received)
@@ -294,6 +320,7 @@ static void udp_server_task_main(void *argument) {
     uint64_t first_packet_ms = 0u;
     uint64_t last_report_ms = started;
     uint32_t client_duration_ms = 0u;
+    bool fin_stats_finalized = false;
     int socket = -1;
     bool success = false;
 
@@ -350,11 +377,22 @@ static void udp_server_task_main(void *argument) {
                     packet, (uint32_t)count, &client_duration_ms);
             }
             if (header.sequence < 0) {
-                wlh_iperf2_udp_stats_finish(&stats, header.sequence);
-                success = send_udp_server_report(
-                    socket, &peer, peer_size, monotonic_ms() - first_packet_ms,
-                    &stats, false);
-                break;
+                /* stats_finish accumulates from next_sequence, so a
+                   retransmitted FIN must only finalize once. */
+                if (!fin_stats_finalized) {
+                    wlh_iperf2_udp_stats_finish(&stats, header.sequence);
+                    fin_stats_finalized = true;
+                }
+                if (send_udp_server_report(socket, &peer, peer_size,
+                                           monotonic_ms() - first_packet_ms,
+                                           &stats, false)) {
+                    success = true;
+                    break;
+                }
+                /* The client retransmits its FIN for ~10 s; a single lost
+                   report must not end the session, try again on the next
+                   copy. */
+                continue;
             }
             wlh_iperf2_udp_stats_add(&stats, &header, (uint32_t)count,
                                      (uint64_t)esp_timer_get_time());
@@ -399,7 +437,8 @@ static esp_err_t start_udp(const wlh_iperf_request_t *request) {
     controller.udp_cancelled = false;
     if (xTaskCreate(request->role == WLH_IPERF_SERVER ? udp_server_task_main
                                                       : udp_client_task_main,
-                    "wlh-iperf-udp", 6144u, &controller.udp_request, 8,
+                    "wlh-iperf-udp", 6144u, &controller.udp_request,
+                    WLH_IPERF_UDP_TASK_PRIORITY,
                     &controller.udp_task) != pdPASS) {
         controller.active_id = -1;
         xSemaphoreGive(controller.mutex);

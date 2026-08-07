@@ -187,6 +187,12 @@ static esp_err_t ota_download(const char *url, uint64_t *image_size,
             err = ESP_FAIL;
             goto cleanup;
         }
+        /* LittleFS flash erases stall the single CPU (UNICORE) inside the
+         * driver; the console task running this download rarely blocks while
+         * HTTP data is buffered, so the IDLE task starves and the Task WDT
+         * panics mid-download. Yield around the flash write so IDLE can feed
+         * the watchdog. */
+        vTaskDelay(pdMS_TO_TICKS(2u));
         if (!magic_checked) {
             if (buffer[0] != OTA_IMAGE_MAGIC) {
                 printf("not an ESP firmware image (magic 0x%02x)\n", buffer[0]);
@@ -204,6 +210,11 @@ static esp_err_t ota_download(const char *url, uint64_t *image_size,
             err = ESP_FAIL;
             goto cleanup;
         }
+        /* LittleFS flash erases stall the single CPU (UNICORE) inside the
+         * driver; the console task running this download never blocks while
+         * HTTP data is buffered, so the IDLE task starves and the Task WDT
+         * panics mid-download. Yield every chunk so IDLE can feed the WDT. */
+        vTaskDelay(pdMS_TO_TICKS(1u));
         total += (uint64_t)read;
         if (total - last_print >= OTA_PROGRESS_STEP) {
             printf("downloaded %llu bytes\n", (unsigned long long)total);

@@ -180,6 +180,17 @@ static int status_command(int argc, char **argv) {
     return 0;
 }
 
+/* Debug hook: a wedged coprocessor keeps its SDIO registers alive, so the
+ * heartbeat never trips and the link stays READY while RPCs hang. Force the
+ * transport recovery path, which pulses the C6 EN pin. */
+static int reset_coproc_command(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    wlh_host_transport_lost(&console_app->host);
+    printf("transport recovery triggered; link will re-handshake\n");
+    return 0;
+}
+
 static int scan_command(int argc, char **argv) {
     command_wait_t wait = new_wait();
     wlh_wifi_scan_params_t params = {
@@ -668,13 +679,17 @@ static void console_library_init(void) {
         .max_cmdline_args = CONSOLE_MAX_CMDLINE_ARGS,
     };
     ESP_ERROR_CHECK(esp_console_init(&console_config));
-    linenoiseSetMultiLine(1);
-    linenoiseSetCompletionCallback(&esp_console_get_completion);
-    linenoiseSetHintsCallback((linenoiseHintsCallback *)&esp_console_get_hint);
+    /* The multi-line ANSI editor queries the cursor via ESC[6n and blocks
+       without timeout waiting for the terminal answer (linenoise.c
+       getCursorPosition). Script-driven consoles never answer DSR, so the
+       console task would hang with no prompt and no echo. Dumb mode keeps a
+       plain prompt, per-character echo and line reads - compatible with both
+       terminals and automation. */
+    linenoiseSetMultiLine(0);
+    linenoiseSetDumbMode(1);
     linenoiseHistorySetMaxLen(CONSOLE_HISTORY_MAX_LEN);
     linenoiseSetMaxLineLen(CONSOLE_MAX_CMDLINE_LENGTH);
     linenoiseAllowEmpty(false);
-    if (linenoiseProbe() != 0) linenoiseSetDumbMode(1);
 }
 
 static void run_segment(const char *segment) {
@@ -735,6 +750,8 @@ void wlh_console_start(wlh_app_t *app) {
     console_library_init();
     esp_console_register_help_command();
     register_command("status", "show link and IP diagnostics", status_command);
+    register_command("reset_coproc", "force coprocessor transport recovery",
+                     reset_coproc_command);
     register_command("scan", "scan nearby Wi-Fi networks", scan_command);
     register_command("sta_connect", "sta_connect <ssid> [password]",
                      sta_connect_command);

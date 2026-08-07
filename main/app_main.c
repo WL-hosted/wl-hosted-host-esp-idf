@@ -135,6 +135,19 @@ void wlh_app_on_event(void *context, const wlh_host_event_t *event) {
                 &app->host, initialize_completion, app);
             if (result != WLH_HOST_OK)
                 ESP_LOGW(TAG, "unable to submit Wi-Fi initialize: %d", result);
+        } else if (event->state == WLH_HOST_STATE_RECOVERING ||
+                   event->state == WLH_HOST_STATE_FAILED) {
+            /* A coprocessor reboot (OTA activation, transport reset) ends the
+             * session; the freshly booted C6 needs a new Wi-Fi initialize
+             * before any connect can work. Without this reset the flag stays
+             * true from the previous session and the C6's Wi-Fi driver never
+             * starts, so every frame is dropped and the link reset-loops.
+             * Also drop the stale netif state so status does not report an
+             * old DHCP lease on a dead link. CONGESTED is transient flow
+             * control and must not tear anything down. */
+            app->wifi_initialized = false;
+            wlh_network_sta_down();
+            wlh_network_ap_down();
         }
         break;
     case WLH_HOST_EVENT_WIFI_SCAN_RESULT:
@@ -206,7 +219,7 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     memset(&g_wlh_app, 0, sizeof(g_wlh_app));
-    g_wlh_app.executor_queue = xQueueCreate(32u, sizeof(wlh_app_task_t));
+    g_wlh_app.executor_queue = xQueueCreate(64u, sizeof(wlh_app_task_t));
     g_wlh_app.command_lock = xSemaphoreCreateMutex();
     g_wlh_app.scan_done = xSemaphoreCreateBinary();
     g_wlh_app.operation_done = xSemaphoreCreateBinary();

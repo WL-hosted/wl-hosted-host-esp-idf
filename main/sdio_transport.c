@@ -58,6 +58,10 @@
 #define WLH_SDIO_IO_TASK_STACK_SIZE 6144u
 #define WLH_SDIO_INIT_RETRIES 3u
 #define WLH_SDIO_TX_BURST_LIMIT 8u
+/* Consecutive invalid length reads before the RX task declares the link
+ * corrupt and triggers the transport recovery path. Transient stale/torn
+ * samples resolve in one or two reads; 10 keeps the delay under ~20 ms. */
+#define WLH_SDIO_RX_INVALID_LIMIT 10u
 #define WLH_SDIO_RX_BURST_LIMIT 8u
 #define WLH_SDIO_IO_IDLE_BIT (1u << 0)
 
@@ -93,6 +97,11 @@ typedef struct sdio_transport {
     bool hardware_initialized;
     uint32_t rx_byte_count;
     uint32_t tx_buffer_count;
+    /* Consecutive invalid length reads while NEW_PACKET stays asserted. A
+     * stale or torn sample resolves on the next read; a stable garbage
+     * length (stuck slave counter or SDIO bus fault) never does, and after
+     * this many retries the RX task hands the link to the recovery path. */
+    unsigned rx_invalid_streak;
 } sdio_transport_t;
 
 static const char *TAG = "wlh-sdio-host";
@@ -285,7 +294,10 @@ static esp_err_t wait_for_tx_buffer(void) {
                 (transport.tx_buffer_count + 1u) % WLH_SDIO_TOKEN_MODULUS;
             return ESP_OK;
         }
-        vTaskDelay(pdMS_TO_TICKS(2u));
+        /* Keep the poll granularity under the frame cadence of a ~20 Mbps
+         * stream: at 2 ms each round-trip the stall latency alone caps the
+         * TCP sender (the C6 pool stays full, so every frame waits here). */
+        vTaskDelay(1u);
     }
     return ESP_ERR_TIMEOUT;
 }
@@ -340,13 +352,18 @@ static esp_err_t write_frame(uint8_t *dma_frame, const uint8_t *frame,
     memset(dma_frame, 0, transfer_size);
     memcpy(dma_frame, frame, size);
     if (!begin_io()) return ESP_ERR_INVALID_STATE;
-    xSemaphoreTake(transport.bus_lock, portMAX_DELAY);
+    /* Wait for a slave RX buffer WITHOUT holding the bus lock. The token poll
+     * sleeps up to 2 ms per round; while it held the lock, the RX task could
+     * not drain frames and the slave's buffers stayed full, so the wait could
+     * wedge the whole datapath for up to its 400 ms timeout under load. The
+     * sdmmc driver serializes transactions internally. */
     result = wait_for_tx_buffer();
     if (result == ESP_OK) {
+        xSemaphoreTake(transport.bus_lock, portMAX_DELAY);
         result =
             write_data(WLH_SDIO_END_ADDRESS - size, dma_frame, transfer_size);
+        xSemaphoreGive(transport.bus_lock);
     }
-    xSemaphoreGive(transport.bus_lock);
     end_io();
     return result;
 }
@@ -406,38 +423,42 @@ static esp_err_t read_pending_frame(uint8_t *frame, size_t *frame_size) {
         return ESP_ERR_NOT_FOUND;
     result = read_register(WLH_SDIO_REG_PACKET_LEN, &packet_length,
                            sizeof(packet_length));
-    /* Clear the interrupt on every path: a failed or garbage transaction
-       must never leave the bit asserted and wedge the RX task. */
-    esp_err_t clear_result = write_register(
-        WLH_SDIO_REG_INT_CLEAR, &interrupt_status, sizeof(interrupt_status));
     if (result != ESP_OK) return result;
-    if (clear_result != ESP_OK) return clear_result;
     raw_packet_length = packet_length;
-    /* The slave length register must never read all 32 bits set: that is the
-     * SDIO bus-fault signature esp-hosted also detects. A single garbage
-     * sample must not poison rx_byte_count, so bail out of this drain (the
-     * outer loop re-arms on the next interrupt) instead of resynchronizing
-     * to a value that would wedge every later read. */
-    if (raw_packet_length == UINT32_MAX) {
-        ESP_LOGW(TAG, "SDIO PACKET_LEN read fault (0xffffffff)");
-        return ESP_ERR_NOT_FOUND;
-    }
     packet_length &= WLH_SDIO_LENGTH_MASK;
     size = (packet_length + WLH_SDIO_LENGTH_MODULUS - transport.rx_byte_count) %
            WLH_SDIO_LENGTH_MODULUS;
+    /* The slave asserts NEW_PACKET when it starts a send and only re-asserts
+     * after the host has read the data, so the interrupt must never be
+     * cleared unless this packet is consumed. A length read that has not
+     * moved (delta 0) or is otherwise invalid is a stale/torn sample from
+     * the slave's cumulative counter register; leaving the interrupt
+     * asserted and retrying is the only safe action: clearing it here would
+     * strand the packet at the slave TX queue head until the heartbeat
+     * recovery power-cycles the coprocessor, and resynchronizing to garbage
+     * would corrupt every later delta. The 0xffffffff sample is the SDIO
+     * bus-fault signature esp-hosted also detects. The caller bounds the
+     * retry: a persistent garbage length is a link fault, not a race. */
+    if (raw_packet_length == UINT32_MAX) {
+        ESP_LOGW(TAG, "SDIO PACKET_LEN read fault (0xffffffff)");
+        return ESP_ERR_INVALID_SIZE;
+    }
     if (packet_length == WLH_SDIO_LENGTH_MASK || size < WLH_FRAME_HEADER_SIZE ||
         size > WLH_SDIO_MAX_FRAME_SIZE) {
-        /* Floating bus or lost framing (e.g. slave mid-reset): drop this
-           transaction and resynchronize to the slave's counter. */
         ESP_LOGW(TAG,
                  "invalid SDIO RX length: raw=0x%08lx previous=%lu "
                  "delta=%lu max=%u",
                  (unsigned long)raw_packet_length,
                  (unsigned long)transport.rx_byte_count, (unsigned long)size,
                  (unsigned)WLH_SDIO_MAX_FRAME_SIZE);
-        transport.rx_byte_count = packet_length;
         return ESP_ERR_INVALID_SIZE;
     }
+    /* Length validated: the interrupt can be cleared now. The slave's next
+     * NEW_PACKET assert follows this packet's CMD53 data read, so it cannot
+     * be lost to the stale status written here. */
+    esp_err_t clear_result = write_register(
+        WLH_SDIO_REG_INT_CLEAR, &interrupt_status, sizeof(interrupt_status));
+    if (clear_result != ESP_OK) return clear_result;
     transfer_size = (uint32_t)((size + WLH_SDIO_BLOCK_SIZE - 1u) &
                                ~(WLH_SDIO_BLOCK_SIZE - 1u));
     result = read_data(WLH_SDIO_END_ADDRESS - size, frame, transfer_size);
@@ -491,17 +512,28 @@ static void rx_task_main(void *argument) {
             result = read_pending_frame(frame, &size);
             xSemaphoreGive(transport.bus_lock);
             end_io();
-            if (result == ESP_ERR_NOT_FOUND) break;
+            if (result == ESP_ERR_NOT_FOUND) {
+                /* The asserted interrupt cleared on its own (slave advanced
+                   or was reset); any corruption episode is over. */
+                transport.rx_invalid_streak = 0u;
+                break;
+            }
             if (result == ESP_ERR_INVALID_SIZE) {
-                /* A misbehaving or mid-reset slave must not be able to pin
-                   this task in an unbounded drain: charge the transaction to
-                   the burst budget like a successful frame. */
-                ESP_LOGW(TAG, "dropping invalid SDIO RX transaction");
-                if (++burst_frames == WLH_SDIO_RX_BURST_LIMIT) {
-                    pending = true;
-                    vTaskDelay(1u);
+                /* Stale/torn length: retry without clearing the interrupt
+                   (see read_pending_frame). A stable garbage length never
+                   fixes itself; hand the link to the recovery path instead
+                   of spinning here or waiting out the 5 s heartbeat. */
+                if (++transport.rx_invalid_streak >=
+                    WLH_SDIO_RX_INVALID_LIMIT) {
+                    ESP_LOGE(TAG,
+                             "SDIO RX length corrupt for %u reads; "
+                             "triggering transport recovery",
+                             transport.rx_invalid_streak);
+                    transport.rx_invalid_streak = 0u;
+                    wlh_host_transport_lost(transport.host);
                     break;
                 }
+                vTaskDelay(pdMS_TO_TICKS(1u));
                 continue;
             }
             if (result != ESP_OK) {
@@ -514,6 +546,7 @@ static void rx_task_main(void *argument) {
                 ESP_LOGW(TAG, "dropping invalid SDIO RX transaction");
                 continue;
             }
+            transport.rx_invalid_streak = 0u;
             {
                 wlh_host_result_t host_result;
                 do {
