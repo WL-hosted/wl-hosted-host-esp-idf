@@ -293,9 +293,22 @@ static void udp_client_task_main(void *argument) {
                         report_received = true;
                         break;
                     }
-                } else if (!send_failure_logged) {
+                    continue;
+                }
+                if (!send_failure_logged) {
                     ESP_LOGW(TAG, "UDP FIN send failed: errno=%d", errno);
                     send_failure_logged = true;
+                }
+                /* A transiently failing send must not spin through the whole
+                   window in milliseconds (observed: one FIN at the session
+                   end failed and the client gave up 3 ms later, even though
+                   the server kept retransmitting its report). Pace the retry
+                   with the report wait so the link can recover, and drain
+                   the socket in case a report from an earlier FIN is already
+                   on its way. */
+                if (lwip_recv(socket, report, sizeof(report), 0) > 0) {
+                    report_received = true;
+                    break;
                 }
             }
         }
