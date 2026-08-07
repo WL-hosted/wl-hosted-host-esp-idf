@@ -282,8 +282,15 @@ static esp_err_t wait_for_tx_buffer(void) {
     for (retry = 0u; retry < 200u; ++retry) {
         uint32_t token = 0u;
         uint32_t available;
-        esp_err_t result =
-            read_register(WLH_SDIO_REG_TOKEN, &token, sizeof(token));
+        esp_err_t result;
+        /* Four-byte CMD53 transfers use card->host.dma_aligned_buffer. The
+         * SDMMC driver's transaction mutex only covers sdmmc_send_cmd(), not
+         * the shared bounce buffer preparation and read-back around it, so
+         * serialize the complete high-level call with the RX path. Release
+         * the lock before delaying so RX can continue draining frames. */
+        xSemaphoreTake(transport.bus_lock, portMAX_DELAY);
+        result = read_register(WLH_SDIO_REG_TOKEN, &token, sizeof(token));
+        xSemaphoreGive(transport.bus_lock);
         if (result != ESP_OK) return result;
         token = (token >> 16) & WLH_SDIO_TOKEN_MASK;
         available =
