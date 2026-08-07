@@ -105,14 +105,21 @@ static bool send_udp_server_report(int socket, const struct sockaddr_in *peer,
         int sent = lwip_sendto(socket, report, sizeof(report), 0,
                                (const struct sockaddr *)peer, peer_size);
         if (sent != (int)sizeof(report)) {
-            /* A momentarily full TX path must not cost the client its final
-               report: wait and retry the way the client's FIN loop does. */
-            if (udp_send_backpressured()) {
-                vTaskDelay(1u);
-                continue;
+            if (!udp_send_backpressured()) {
+                ESP_LOGW(TAG, "UDP server report send failed: errno=%d", errno);
+                return false;
             }
-            ESP_LOGW(TAG, "UDP server report send failed: errno=%d", errno);
-            return false;
+            /* The client paces its FIN retransmissions, not our backpressure;
+               a burst of TX congestion can outlast a 1 ms spin (observed:
+               the server deadline report bounced on ENOBUFS for longer and
+               the client never got its report). Wait for the next FIN,
+               bounded by the socket receive timeout, and retry then. */
+            if (lwip_recvfrom(socket, received, sizeof(received), 0, NULL, NULL) <
+                0) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK) return false;
+                return false;
+            }
+            continue;
         }
         /* iPerf2 retransmits its FIN while it waits for this report.  Drain
          * one such retransmission before sending the next copy. */
@@ -349,14 +356,17 @@ static void udp_server_task_main(void *argument) {
         uint64_t deadline = (uint64_t)request->duration_sec * 1000u;
         if (first_packet_ms != 0u && client_duration_ms != 0u &&
             elapsed >= client_duration_ms) {
+            /* The client keeps retransmitting its FIN while it waits for the
+               report; drain those so a congested TX burst cannot cost the
+               client its final report. */
             success = send_udp_server_report(socket, &peer, peer_size, elapsed,
-                                             &stats, true);
+                                             &stats, false);
             break;
         }
         if (first_packet_ms == 0u && now - started >= deadline) break;
         if (first_packet_ms != 0u && now - first_packet_ms >= deadline) {
             success = send_udp_server_report(socket, &peer, peer_size, elapsed,
-                                             &stats, true);
+                                             &stats, false);
             break;
         }
         count = lwip_recvfrom(socket, packet, sizeof(packet), 0,
