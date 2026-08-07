@@ -114,8 +114,8 @@ static bool send_udp_server_report(int socket, const struct sockaddr_in *peer,
                the server deadline report bounced on ENOBUFS for longer and
                the client never got its report). Wait for the next FIN,
                bounded by the socket receive timeout, and retry then. */
-            if (lwip_recvfrom(socket, received, sizeof(received), 0, NULL, NULL) <
-                0) {
+            if (lwip_recvfrom(socket, received, sizeof(received), 0, NULL,
+                              NULL) < 0) {
                 if (errno != EAGAIN && errno != EWOULDBLOCK) return false;
                 return false;
             }
